@@ -12,7 +12,6 @@ use tiny_http::{Header, Response, Server};
 use urlencoding::decode;
 
 const IMPACT_ETHERTYPE: EtherType = EtherType(0x88B5);
-const TOTAL_NODES: u32 = 3;
 const HISTORY_DURATION: Duration = Duration::from_millis(1000);
 const DEFAULT_TTL: u8 = 10;
 const MAX_CHUNK_SIZE: usize = 1000;
@@ -111,13 +110,13 @@ fn get_mac(node_id: u32) -> MacAddr {
     MacAddr::new(2, 0, 0, 0, 0, node_id as u8)
 }
 
-fn get_next_alive(current: u32, live_nodes: &HashMap<u8, Instant>, forward: bool) -> MacAddr {
+fn get_next_alive(current: u32, total_nodes: u32, live_nodes: &HashMap<u8, Instant>, forward: bool) -> MacAddr {
     let mut next = current;
-    for _ in 0..TOTAL_NODES {
+    for _ in 0..total_nodes {
         next = if forward {
-            if next == TOTAL_NODES { 1 } else { next + 1 }
+            if next == total_nodes { 1 } else { next + 1 }
         } else {
-            if next == 1 { TOTAL_NODES } else { next - 1 }
+            if next == 1 { total_nodes } else { next - 1 }
         };
         
         if next == current { break; }
@@ -130,9 +129,9 @@ fn get_next_alive(current: u32, live_nodes: &HashMap<u8, Instant>, forward: bool
     }
     // Fallback if no heartbeats seen yet
     get_mac(if forward {
-        if current == TOTAL_NODES { 1 } else { current + 1 }
+        if current == total_nodes { 1 } else { current + 1 }
     } else {
-        if current == 1 { TOTAL_NODES } else { current - 1 }
+        if current == 1 { total_nodes } else { current - 1 }
     })
 }
 
@@ -167,7 +166,7 @@ struct StatsResponse {
     dead_nodes: Vec<u8>,
 }
 
-fn spawn_node(interface_name: String, node_id: u32, shared: Arc<SharedState>, enable_snapshots: bool, kill_switch: Arc<Mutex<bool>>) {
+fn spawn_node(interface_name: String, node_id: u32, total_nodes: u32, shared: Option<Arc<SharedState>>, enable_snapshots: bool) {
     let interfaces = datalink::interfaces();
     let interface = interfaces.into_iter().find(|i| i.name == interface_name).expect("Interface not found");
 
@@ -191,35 +190,28 @@ fn spawn_node(interface_name: String, node_id: u32, shared: Arc<SharedState>, en
     let mut last_heartbeat = Instant::now();
 
     loop {
-        if *kill_switch.lock().unwrap() {
-            thread::sleep(Duration::from_millis(100));
-            continue; // CRASH SIMULATION! Node stops all L2 processing.
-        }
-
         let now = Instant::now();
         
-        // Broadcast Heartbeat
         if now.duration_since(last_heartbeat) > Duration::from_millis(100) {
             let hb = Packet::Heartbeat { origin_mac: node_id as u8 };
             send_l2_packet(&mut tx, my_mac, MacAddr::broadcast(), &hb);
             last_heartbeat = now;
             live_nodes.insert(node_id as u8, now);
-            if node_id == 1 {
-                shared.global_live_nodes.lock().unwrap().insert(node_id as u8, now);
+            if let Some(ref s) = shared {
+                s.global_live_nodes.lock().unwrap().insert(node_id as u8, now);
             }
         }
 
         // True Self-Healing: Data Rescue Operation
-        for i in 1..=TOTAL_NODES {
+        for i in 1..=total_nodes {
             if i == node_id { continue; }
             let is_alive = if let Some(&time) = live_nodes.get(&(i as u8)) {
                 now.duration_since(time) < Duration::from_millis(500)
             } else { false };
             
             if !is_alive && !known_dead.contains_key(&(i as u8)) {
-                // Node just died! Trigger Rescue Operation.
                 known_dead.insert(i as u8, true);
-                let data_next_mac = get_next_alive(node_id, &live_nodes, true);
+                let data_next_mac = get_next_alive(node_id, total_nodes, &live_nodes, true);
                 for ((k, chunk_idx), (data, total_chunks, epoch, _)) in recent_data.iter() {
                     let rescue_packet = Packet::Data { key: k.clone(), chunk_index: *chunk_idx, total_chunks: *total_chunks, data: data.clone(), epoch: *epoch };
                     send_l2_packet(&mut tx, my_mac, data_next_mac, &rescue_packet);
@@ -232,18 +224,21 @@ fn spawn_node(interface_name: String, node_id: u32, shared: Arc<SharedState>, en
         if let Ok(frame) = rx.next() {
             if let Some(eth) = EthernetPacket::new(frame) {
                 let dest = eth.get_destination();
-                if eth.get_ethertype() == IMPACT_ETHERTYPE && (dest == my_mac || dest == MacAddr::broadcast()) {
+                // Filter broadcasts from ourselves to prevent loopbacks if the switch bounces it
+                let is_our_broadcast = eth.get_source() == my_mac;
+
+                if eth.get_ethertype() == IMPACT_ETHERTYPE && (dest == my_mac || (dest == MacAddr::broadcast() && !is_our_broadcast)) {
                     if let Some(packet) = Packet::from_bytes(eth.payload()) {
                         let now = Instant::now();
                         
-                        let data_next_mac = get_next_alive(node_id, &live_nodes, true);
-                        let query_next_mac = get_next_alive(node_id, &live_nodes, false);
+                        let data_next_mac = get_next_alive(node_id, total_nodes, &live_nodes, true);
+                        let query_next_mac = get_next_alive(node_id, total_nodes, &live_nodes, false);
 
                         match packet {
                             Packet::Heartbeat { origin_mac } => {
                                 live_nodes.insert(origin_mac, now);
-                                if node_id == 1 {
-                                    shared.global_live_nodes.lock().unwrap().insert(origin_mac, now);
+                                if let Some(ref s) = shared {
+                                    s.global_live_nodes.lock().unwrap().insert(origin_mac, now);
                                 }
                             }
                             Packet::Data { key, chunk_index, total_chunks, data, epoch } => {
@@ -283,8 +278,8 @@ fn spawn_node(interface_name: String, node_id: u32, shared: Arc<SharedState>, en
                             }
                             Packet::Response { key, chunk_index, total_chunks, data, .. } => {
                                 if dest == my_mac {
-                                    if node_id == 1 {
-                                        let mut map = shared.http_responses.lock().unwrap();
+                                    if let Some(ref s) = shared {
+                                        let mut map = s.http_responses.lock().unwrap();
                                         let entry = map.entry(key).or_insert_with(|| (HashMap::new(), total_chunks));
                                         entry.0.insert(chunk_index, data);
                                     }
@@ -301,8 +296,8 @@ fn spawn_node(interface_name: String, node_id: u32, shared: Arc<SharedState>, en
             recent_data.retain(|_, (_, _, _, time)| now.duration_since(*time) < HISTORY_DURATION);
             recent_queries.retain(|_, (_, time)| now.duration_since(*time) < HISTORY_DURATION);
             
-            if node_id == 1 {
-                *shared.active_data_count.lock().unwrap() = recent_data.len();
+            if let Some(ref s) = shared {
+                *s.active_data_count.lock().unwrap() = recent_data.len();
             }
             last_cleanup = now;
         }
@@ -361,22 +356,52 @@ fn inject_string_payload(web_tx: &mut Box<dyn datalink::DataLinkSender>, node1_m
 }
 
 fn main() {
+    let mut interface_name = String::new();
+    let mut node_id: u32 = 1;
+    let mut total_nodes: u32 = 3;
+    let mut enable_snapshots = false;
+
     let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        eprintln!("Usage: sudo cargo run --bin server <INTERFACE_NAME> [--snapshots]");
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--node" => { i += 1; if i < args.len() { node_id = args[i].parse().unwrap_or(1); } }
+            "--total-nodes" => { i += 1; if i < args.len() { total_nodes = args[i].parse().unwrap_or(3); } }
+            "--snapshots" => { enable_snapshots = true; }
+            val => {
+                if interface_name.is_empty() && !val.starts_with("--") {
+                    interface_name = val.to_string();
+                }
+            }
+        }
+        i += 1;
+    }
+
+    if interface_name.is_empty() {
+        eprintln!("Usage: sudo cargo run --bin server <INTERFACE> [--node ID] [--total-nodes N] [--snapshots]");
         std::process::exit(1);
     }
-    let interface_name = args[1].clone();
-    let enable_snapshots = args.contains(&"--snapshots".to_string());
 
+    println!("Starting impactDB L2 Node {} on interface {} (Total Ring Size: {})", node_id, interface_name, total_nodes);
+
+    if node_id != 1 {
+        // Run as a pure relay node
+        spawn_node(interface_name, node_id, total_nodes, None, false);
+        return; // Will never reach here
+    }
+
+    // Node 1 is the Gateway/Orchestrator
     let shared = Arc::new(SharedState {
         http_responses: Mutex::new(HashMap::new()),
         active_data_count: Mutex::new(0),
         global_live_nodes: Mutex::new(HashMap::new()),
     });
 
-    println!("Starting impactDB L2 Cluster on interface {}...", interface_name);
-    
+    let iface = interface_name.clone();
+    let s = Arc::clone(&shared);
+    let snaps = enable_snapshots;
+    thread::spawn(move || spawn_node(iface, 1, total_nodes, Some(s), snaps));
+
     let interfaces = datalink::interfaces();
     let interface = interfaces.into_iter().find(|i| i.name == interface_name).expect("Interface not found");
     let mut config = datalink::Config::default();
@@ -387,19 +412,8 @@ fn main() {
     };
     
     let node1_mac = get_mac(1);
-    
-    let mut kill_switches = HashMap::new();
 
-    for i in 1..=TOTAL_NODES {
-        let iface = interface_name.clone();
-        let s = Arc::clone(&shared);
-        let snaps = enable_snapshots;
-        let ks = Arc::new(Mutex::new(false));
-        kill_switches.insert(i, Arc::clone(&ks));
-        thread::spawn(move || spawn_node(iface, i, s, snaps, ks));
-    }
-
-    println!("Cluster orchestrated. L2 rings operational. Warming up hardware...");
+    println!("Gateway orchestrated. L2 rings operational. Warming up hardware...");
     thread::sleep(Duration::from_millis(1000));
 
     if enable_snapshots {
@@ -408,7 +422,7 @@ fn main() {
                 println!("Restoring {} items from snapshot...", items.len());
                 for item in items {
                     let map = shared.global_live_nodes.lock().unwrap();
-                    let dest_mac = get_next_alive(1, &*map, true);
+                    let dest_mac = get_next_alive(1, total_nodes, &*map, true);
                     drop(map);
                     inject_string_payload(&mut web_tx, node1_mac, dest_mac, item.key, item.value);
                 }
@@ -417,7 +431,7 @@ fn main() {
         }
     }
 
-    println!("Starting Web Dashboard on http://localhost:3000");
+    println!("Starting Web Dashboard on http://0.0.0.0:3000");
 
     let server = Server::http("0.0.0.0:3000").unwrap();
     let html = include_str!("index.html");
@@ -440,7 +454,7 @@ fn main() {
                 }
                 
                 let map = shared.global_live_nodes.lock().unwrap();
-                let data_next_mac = get_next_alive(1, &*map, true);
+                let data_next_mac = get_next_alive(1, total_nodes, &*map, true);
                 drop(map);
 
                 let start = Instant::now();
@@ -457,7 +471,7 @@ fn main() {
                     shared.http_responses.lock().unwrap().remove(&key);
 
                     let map = shared.global_live_nodes.lock().unwrap();
-                    let query_next_mac = get_next_alive(1, &*map, false);
+                    let query_next_mac = get_next_alive(1, total_nodes, &*map, false);
                     drop(map);
 
                     let p = Packet::Query { key: key.clone(), origin_mac: 1, ttl: DEFAULT_TTL };
@@ -499,28 +513,17 @@ fn main() {
                 }
             }
         } else if url.starts_with("/api/kill") {
-            if let Some((_, query)) = url.split_once('?') {
-                let parts: Vec<&str> = query.split('=').collect();
-                if parts.len() == 2 && parts[0] == "node" {
-                    if let Ok(n) = parts[1].parse::<u32>() {
-                        if let Some(ks) = kill_switches.get(&n) {
-                            *ks.lock().unwrap() = true;
-                            request.respond(Response::from_string(format!("{{\"status\":\"Node {} Killed\"}}", n))).unwrap();
-                            continue;
-                        }
-                    }
-                }
-            }
+            request.respond(Response::from_string("{\"status\":\"API Kill Disabled in Multi-Machine Mode\"}")).unwrap();
         } else if url == "/api/stats" {
             let count = *shared.active_data_count.lock().unwrap();
             
             let map = shared.global_live_nodes.lock().unwrap();
             let mut dead_nodes = Vec::new();
-            for i in 1..=TOTAL_NODES {
+            for i in 1..=total_nodes {
                 let is_alive = if let Some(&time) = map.get(&(i as u8)) {
                     Instant::now().duration_since(time) < Duration::from_millis(500)
                 } else { false };
-                if !is_alive { dead_nodes.push(i as u8); }
+                if !is_alive && i != 1 { dead_nodes.push(i as u8); }
             }
             drop(map);
 
