@@ -43,12 +43,25 @@ Because impactDB operates at OSI Layer 2 using raw sockets, it requires speciali
 git clone git@github.com:matelabdev/impactDB.git
 cd impactDB
 
-# Run the cluster orchestrator on a virtual or physical interface
-# Example: bridge0 for macOS, eth0 for Linux
-sudo cargo run --bin server bridge0
+### 1. Starting the Orchestrator (Node 1)
+```bash
+sudo cargo run --bin server <INTERFACE> --node 1 --total-nodes 2
+```
+*Note: To run multiple nodes on a single physical machine for testing, append `--virtual-mac`.*
 
-# To enable Ephemeral Snapshots (Boot persistence):
-sudo cargo run --bin server bridge0 --snapshots
+### 2. Starting a Relay Node (Node 2)
+```bash
+sudo cargo run --bin server <INTERFACE> --node 2 --total-nodes 2
+```
+
+### 3. Using the Standalone CLI (impactdb)
+You can inject and intercept data directly via the command-line, completely bypassing the Web Gateway. The CLI operates natively at Layer 2:
+```bash
+# Inject Data
+sudo cargo run --bin impactdb <INTERFACE> set my_key "Hello L2 Network!"
+
+# Retrieve Data
+sudo cargo run --bin impactdb <INTERFACE> get my_key
 ```
 
 ## 🏗 System Architecture

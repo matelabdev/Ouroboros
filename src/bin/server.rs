@@ -106,6 +106,10 @@ impl Packet {
     }
 }
 
+fn get_mac(node_id: u32) -> MacAddr {
+    MacAddr::new(2, 0, 0, 0, 0, node_id as u8)
+}
+
 fn get_next_alive(current: u32, total_nodes: u32, live_nodes: &HashMap<u8, (MacAddr, Instant)>, forward: bool) -> MacAddr {
     let mut next = current;
     for _ in 0..total_nodes {
@@ -159,11 +163,16 @@ struct StatsResponse {
     dead_nodes: Vec<u8>,
 }
 
-fn spawn_node(interface_name: String, node_id: u32, total_nodes: u32, shared: Option<Arc<SharedState>>, enable_snapshots: bool) {
+fn spawn_node(interface_name: String, node_id: u32, total_nodes: u32, shared: Option<Arc<SharedState>>, enable_snapshots: bool, use_virtual_mac: bool) {
     let interfaces = datalink::interfaces();
     let interface = interfaces.into_iter().find(|i| i.name == interface_name).expect("Interface not found");
 
-    let my_mac = interface.mac.expect("Interface must have a hardware MAC address");
+    let my_mac = if use_virtual_mac {
+        get_mac(node_id)
+    } else {
+        interface.mac.expect("Interface must have a hardware MAC address")
+    };
+    
     let mut config = datalink::Config::default();
     config.read_timeout = Some(Duration::from_millis(10));
 
@@ -372,6 +381,7 @@ fn main() {
     let mut node_id: u32 = 1;
     let mut total_nodes: u32 = 3;
     let mut enable_snapshots = false;
+    let mut use_virtual_mac = false;
 
     let args: Vec<String> = env::args().collect();
     let mut i = 1;
@@ -380,6 +390,7 @@ fn main() {
             "--node" => { i += 1; if i < args.len() { node_id = args[i].parse().unwrap_or(1); } }
             "--total-nodes" => { i += 1; if i < args.len() { total_nodes = args[i].parse().unwrap_or(3); } }
             "--snapshots" => { enable_snapshots = true; }
+            "--virtual-mac" => { use_virtual_mac = true; }
             val => {
                 if interface_name.is_empty() && !val.starts_with("--") {
                     interface_name = val.to_string();
@@ -398,7 +409,7 @@ fn main() {
 
     if node_id != 1 {
         // Run as a pure relay node
-        spawn_node(interface_name, node_id, total_nodes, None, false);
+        spawn_node(interface_name, node_id, total_nodes, None, false, use_virtual_mac);
         return; // Will never reach here
     }
 
@@ -412,7 +423,8 @@ fn main() {
     let iface = interface_name.clone();
     let s = Arc::clone(&shared);
     let snaps = enable_snapshots;
-    thread::spawn(move || spawn_node(iface, 1, total_nodes, Some(s), snaps));
+    let v_mac = use_virtual_mac;
+    thread::spawn(move || spawn_node(iface, 1, total_nodes, Some(s), snaps, v_mac));
 
     let interfaces = datalink::interfaces();
     let interface = interfaces.into_iter().find(|i| i.name == interface_name).expect("Interface not found");
@@ -423,7 +435,11 @@ fn main() {
         _ => panic!("Need Ethernet channel"),
     };
     
-    let node1_mac = interface.mac.expect("Interface must have a hardware MAC address");
+    let node1_mac = if use_virtual_mac {
+        get_mac(1)
+    } else {
+        interface.mac.expect("Interface must have a hardware MAC address")
+    };
 
     println!("Gateway orchestrated. L2 rings operational. Warming up hardware...");
     thread::sleep(Duration::from_millis(1000));
