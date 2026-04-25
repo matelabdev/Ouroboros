@@ -58,7 +58,7 @@ fn main() {
             s
         },
         Err(_) => {
-            eprintln!("Could not connect to impactDB on 127.0.0.1:8825.");
+            eprintln!("Could not connect to Ouroboros on 127.0.0.1:8825.");
             eprintln!("Is the server running?");
             std::process::exit(1);
         }
@@ -68,7 +68,7 @@ fn main() {
         let cmd = args[1..].join(" ");
         execute_command(&mut stream, &cmd);
     } else {
-        println!("impactdb-cli (connected to 127.0.0.1:8825 via Raw TCP)");
+        println!("ouroboros-cli (connected to 127.0.0.1:8825 via Raw TCP)");
         loop {
             print!("> ");
             io::stdout().flush().unwrap();

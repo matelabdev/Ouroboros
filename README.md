@@ -1,13 +1,13 @@
-# impactDB 🚀
+# Ouroboros 🚀
 **The Layer 2 "Data-in-Flight" Storage Engine**
 
-impactDB is an experimental, extremely high-performance storage engine that completely bypasses persistent storage (RAM/Disk) and the traditional OS network stack (TCP/UDP/IP). Instead, it stores data **in the network cables**, continuously orbiting Ethernet frames in a Ring Topology using raw Layer 2 packets.
+Ouroboros is an experimental, extremely high-performance storage engine that completely bypasses persistent storage (RAM/Disk) and the traditional OS network stack (TCP/UDP/IP). Instead, it stores data **in the network cables**, continuously orbiting Ethernet frames in a Ring Topology using raw Layer 2 packets.
 
 ---
 
 ## ⚡ Core Philosophy
 Why store data when you can just keep it moving?
-In impactDB, data is injected into the network as custom Ethernet frames (EtherType `0x88B5`). The nodes in the cluster act purely as relay stations, instantly forwarding the data to the next node.
+In Ouroboros, data is injected into the network as custom Ethernet frames (EtherType `0x88B5`). The nodes in the cluster act purely as relay stations, instantly forwarding the data to the next node.
 - **Storage Medium:** Network Wire (Fiber/Copper)
 - **Persistence:** None (unless Snapshotting is enabled)
 - **Latency:** 795µs (single-machine virtual), ~45ms (physical Wi-Fi cross-device).
@@ -15,7 +15,7 @@ In impactDB, data is injected into the network as custom Ethernet frames (EtherT
 ## 🛠 Features
 
 1. **Kernel Bypass (Layer 2 Nirvana):**
-   Powered by `pnet`, impactDB communicates directly with the NIC using Raw Sockets, skipping the Linux Kernel's network stack entirely for nanosecond-level packet processing.
+   Powered by `pnet`, Ouroboros communicates directly with the NIC using Raw Sockets, skipping the Linux Kernel's network stack entirely for nanosecond-level packet processing.
 
 2. **Payload Fragmentation:**
    Data strings exceeding 1000 bytes are automatically fragmented into chunks, routed independently, and reassembled in-memory upon query interception.
@@ -49,8 +49,8 @@ In impactDB, data is injected into the network as custom Ethernet frames (EtherT
 ### Installation
 
 ```bash
-git clone git@github.com:matelabdev/impactDB.git
-cd impactDB
+git clone git@github.com:matelabdev/Ouroboros.git
+cd Ouroboros
 ```
 
 ### 1. Starting the Orchestrator (Node 1 — Gateway + Web UI)
@@ -78,18 +78,18 @@ sudo cargo run --bin server bridge0 --node 1 --total-nodes 3 --virtual-mac
 # Spawns Node 2 and Node 3 automatically as background threads
 ```
 
-### 3. Using the CLI (impactdb)
+### 3. Using the CLI (ouroboros)
 The CLI connects to the local node's HTTP gateway (`localhost:8825`) — no `sudo` required:
 
 ```bash
 # Build the CLI
-cargo build --bin impactdb
+cargo build --bin ouroboros
 
 # Set a value
-cargo run --bin impactdb set my_key "Hello L2 Network!"
+cargo run --bin ouroboros set my_key "Hello L2 Network!"
 
 # Get a value
-cargo run --bin impactdb get my_key
+cargo run --bin ouroboros get my_key
 ```
 
 Expected output:

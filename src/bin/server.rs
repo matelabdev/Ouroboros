@@ -13,7 +13,7 @@ use std::io::{Write, BufReader, BufRead};
 use tiny_http::{Header, Response, Server};
 use urlencoding::decode;
 
-const IMPACT_ETHERTYPE: EtherType = EtherType(0x88B5);
+const OUROBOROS_ETHERTYPE: EtherType = EtherType(0x88B5);
 const HISTORY_DURATION: Duration = Duration::from_millis(1000);
 const DEFAULT_TTL: u8 = 10;
 const MAX_CHUNK_SIZE: usize = 1000;
@@ -149,7 +149,7 @@ fn send_l2_packet(tx: &mut Box<dyn datalink::DataLinkSender>, my_mac: MacAddr, _
     // FORCE BROADCAST: Bypasses macOS Wi-Fi driver issues with raw Unicast frames
     eth_packet.set_destination(MacAddr::broadcast());
     eth_packet.set_source(my_mac);
-    eth_packet.set_ethertype(IMPACT_ETHERTYPE);
+    eth_packet.set_ethertype(OUROBOROS_ETHERTYPE);
     eth_packet.set_payload(&payload);
     tx.send_to(eth_packet.packet(), None);
 }
@@ -278,7 +278,7 @@ fn spawn_node(interface_name: String, node_id: u32, shared: Option<Arc<SharedSta
                 // Filter broadcasts from ourselves to prevent loopbacks if the switch bounces it
                 let is_our_broadcast = eth.get_source() == my_mac;
 
-                if eth.get_ethertype() == IMPACT_ETHERTYPE && (dest == my_mac || (dest == MacAddr::broadcast() && !is_our_broadcast)) {
+                if eth.get_ethertype() == OUROBOROS_ETHERTYPE && (dest == my_mac || (dest == MacAddr::broadcast() && !is_our_broadcast)) {
                     if let Some(packet) = Packet::from_bytes(eth.payload()) {
                         let now = Instant::now();
                         
@@ -381,7 +381,7 @@ fn spawn_node(interface_name: String, node_id: u32, shared: Option<Arc<SharedSta
             }
 
             if let Ok(json) = serde_json::to_string(&items) {
-                let _ = fs::write("impactdb_snapshot.json", json);
+                let _ = fs::write("ouroboros_snapshot.json", json);
             }
             last_snapshot = now;
         }
@@ -550,7 +550,7 @@ fn main() {
         std::process::exit(1);
     }
 
-    println!("Starting impactDB L2 Node {} on interface {} (Peer Autodiscovery Active)", node_id, interface_name);
+    println!("Starting Ouroboros L2 Node {} on interface {} (Peer Autodiscovery Active)", node_id, interface_name);
 
     // In virtual-mac mode, Node 1 owns all relay threads — single command, full cluster
     if use_virtual_mac && node_id == 1 {
@@ -718,7 +718,7 @@ fn main() {
     thread::sleep(Duration::from_millis(1000));
 
     if enable_snapshots {
-        if let Ok(data) = fs::read_to_string("impactdb_snapshot.json") {
+        if let Ok(data) = fs::read_to_string("ouroboros_snapshot.json") {
             if let Ok(items) = serde_json::from_str::<Vec<SnapshotItem>>(&data) {
                 println!("Restoring {} items from snapshot...", items.len());
                 for item in items {
