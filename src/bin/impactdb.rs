@@ -11,7 +11,7 @@ fn main() {
         eprintln!("  impactdb set <key> <value>");
         eprintln!("  impactdb keys [pattern]   (e.g. 'user_*', default: *)");
         eprintln!("");
-        eprintln!("Connects to the local impactDB node gateway at http://localhost:3000");
+        eprintln!("Connects to the local impactDB node gateway at http://localhost:8825");
         std::process::exit(1);
     }
 
@@ -23,7 +23,7 @@ fn main() {
             let key = &args[2];
             let start = Instant::now();
             let url = format!(
-                "http://localhost:3000/api/get?k={}",
+                "http://localhost:8825/api/get?k={}",
                 urlencoding::encode(key)
             );
 
@@ -53,7 +53,7 @@ fn main() {
             let value = &args[3];
             let start = Instant::now();
             let url = format!(
-                "http://localhost:3000/api/set?k={}&v={}",
+                "http://localhost:8825/api/set?k={}&v={}",
                 urlencoding::encode(key),
                 urlencoding::encode(value)
             );
@@ -71,7 +71,7 @@ fn main() {
         }
         "keys" => {
             let pattern = args.get(2).map(|s| s.as_str()).unwrap_or("*");
-            let url = format!("http://localhost:3000/api/keys?pattern={}", urlencoding::encode(pattern));
+            let url = format!("http://localhost:8825/api/keys?pattern={}", urlencoding::encode(pattern));
 
             match ureq::get(&url).call() {
                 Ok(response) => {

@@ -33,10 +33,10 @@ In impactDB, data is injected into the network as custom Ethernet frames (EtherT
    No hardcoded topology. Nodes discover each other automatically via Heartbeat broadcasts. The ring expands when a node joins and contracts when one drops — no restarts, no config changes required.
 
 7. **HTTP Gateway on every node:**
-   Every node (orchestrator and relay) exposes a local HTTP API on port `3000`. This allows clients and CLI tools to interact with the ring without competing for raw socket access.
+   Every node (orchestrator and relay) exposes a local HTTP API on port `8825`. This allows clients and CLI tools to interact with the ring without competing for raw socket access.
 
 8. **Glassmorphic Web Dashboard:**
-   Node 1 hosts a Vue.js Web UI on `http://localhost:3000` to visualize packet flow, monitor node health, and measure microsecond latencies.
+   Node 1 hosts a Vue.js Web UI on `http://localhost:8825` to visualize packet flow, monitor node health, and measure microsecond latencies.
 
 ## 🚀 Getting Started
 
@@ -57,7 +57,7 @@ cd impactDB
 ```bash
 sudo cargo run --bin server <INTERFACE> --node 1
 ```
-> Web dashboard available at `http://localhost:3000`
+> Web dashboard available at `http://localhost:8825`
 > Replace `<INTERFACE>` with your network interface (`en0`, `eth0`, `bridge0`, etc.)
 
 ### 2. Starting a Relay Node (Node 2+)
@@ -65,7 +65,7 @@ sudo cargo run --bin server <INTERFACE> --node 1
 sudo cargo run --bin server <INTERFACE> --node 2
 ```
 > The relay discovers Node 1 automatically via Heartbeats within ~100ms. The ring expands live.
-> Each relay also exposes a local HTTP gateway at `http://localhost:3000`
+> Each relay also exposes a local HTTP gateway at `http://localhost:8825`
 
 **To add a third node at any time — no restarts needed:**
 ```bash
@@ -79,7 +79,7 @@ sudo cargo run --bin server bridge0 --node 1 --total-nodes 3 --virtual-mac
 ```
 
 ### 3. Using the CLI (impactdb)
-The CLI connects to the local node's HTTP gateway (`localhost:3000`) — no `sudo` required:
+The CLI connects to the local node's HTTP gateway (`localhost:8825`) — no `sudo` required:
 
 ```bash
 # Build the CLI

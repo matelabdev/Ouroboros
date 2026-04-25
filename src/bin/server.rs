@@ -481,14 +481,14 @@ fn main() {
         };
         let relay_mac = if use_virtual_mac { get_mac(node_id) } else { interface.mac.expect("No MAC") };
 
-        let server = (3000u16..3010)
+        let server = (8825u16..8835)
             .find_map(|port| {
                 match Server::http(format!("0.0.0.0:{}", port)) {
                     Ok(s) => { println!("Starting local HTTP gateway on http://0.0.0.0:{}", port); Some(s) }
                     Err(_) => None,
                 }
             })
-            .expect("Could not bind to any port in range 3000-3009");
+            .expect("Could not bind to any port in range 8825-8834");
         for request in server.incoming_requests() {
             let url = request.url().to_string();
             if url.starts_with("/api/get") {
@@ -616,14 +616,14 @@ fn main() {
         }
     }
 
-    let server = (3000u16..3010)
+    let server = (8825u16..8835)
         .find_map(|port| {
             match Server::http(format!("0.0.0.0:{}", port)) {
                 Ok(s) => { println!("Starting Web Dashboard on http://0.0.0.0:{}", port); Some(s) }
                 Err(_) => None,
             }
         })
-        .expect("Could not bind to any port in range 3000-3009");
+        .expect("Could not bind to any port in range 8825-8834");
     let html = include_str!("index.html");
 
     for request in server.incoming_requests() {
