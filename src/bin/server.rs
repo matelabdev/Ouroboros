@@ -106,11 +106,7 @@ impl Packet {
     }
 }
 
-fn get_mac(node_id: u32) -> MacAddr {
-    MacAddr::new(2, 0, 0, 0, 0, node_id as u8)
-}
-
-fn get_next_alive(current: u32, total_nodes: u32, live_nodes: &HashMap<u8, Instant>, forward: bool) -> MacAddr {
+fn get_next_alive(current: u32, total_nodes: u32, live_nodes: &HashMap<u8, (MacAddr, Instant)>, forward: bool) -> MacAddr {
     let mut next = current;
     for _ in 0..total_nodes {
         next = if forward {
@@ -121,18 +117,14 @@ fn get_next_alive(current: u32, total_nodes: u32, live_nodes: &HashMap<u8, Insta
         
         if next == current { break; }
         
-        if let Some(&time) = live_nodes.get(&(next as u8)) {
+        if let Some(&(mac, time)) = live_nodes.get(&(next as u8)) {
             if Instant::now().duration_since(time) < Duration::from_millis(500) {
-                return get_mac(next);
+                return mac;
             }
         }
     }
-    // Fallback if no heartbeats seen yet
-    get_mac(if forward {
-        if current == total_nodes { 1 } else { current + 1 }
-    } else {
-        if current == 1 { total_nodes } else { current - 1 }
-    })
+    // Fallback: If we don't know their MAC address yet, broadcast it to the switch
+    MacAddr::broadcast()
 }
 
 fn send_l2_packet(tx: &mut Box<dyn datalink::DataLinkSender>, my_mac: MacAddr, dest_mac: MacAddr, packet: &Packet) {
@@ -156,7 +148,7 @@ struct SnapshotItem {
 struct SharedState {
     http_responses: Mutex<HashMap<String, (HashMap<u16, Vec<u8>>, u16)>>,
     active_data_count: Mutex<usize>,
-    global_live_nodes: Mutex<HashMap<u8, Instant>>,
+    global_live_nodes: Mutex<HashMap<u8, (MacAddr, Instant)>>,
 }
 
 #[derive(Serialize)]
@@ -170,7 +162,7 @@ fn spawn_node(interface_name: String, node_id: u32, total_nodes: u32, shared: Op
     let interfaces = datalink::interfaces();
     let interface = interfaces.into_iter().find(|i| i.name == interface_name).expect("Interface not found");
 
-    let my_mac = get_mac(node_id);
+    let my_mac = interface.mac.expect("Interface must have a hardware MAC address");
     let mut config = datalink::Config::default();
     config.read_timeout = Some(Duration::from_millis(10));
 
@@ -182,7 +174,7 @@ fn spawn_node(interface_name: String, node_id: u32, total_nodes: u32, shared: Op
     let mut seen_epochs = HashMap::<(String, u16), u32>::new();
     let mut recent_data = HashMap::<(String, u16), (Vec<u8>, u16, u32, Instant)>::new();
     let mut recent_queries = HashMap::<String, (u8, Instant)>::new();
-    let mut live_nodes = HashMap::<u8, Instant>::new();
+    let mut live_nodes = HashMap::<u8, (MacAddr, Instant)>::new();
     let mut known_dead = HashMap::<u8, bool>::new();
 
     let mut last_cleanup = Instant::now();
@@ -196,16 +188,16 @@ fn spawn_node(interface_name: String, node_id: u32, total_nodes: u32, shared: Op
             let hb = Packet::Heartbeat { origin_mac: node_id as u8 };
             send_l2_packet(&mut tx, my_mac, MacAddr::broadcast(), &hb);
             last_heartbeat = now;
-            live_nodes.insert(node_id as u8, now);
+            live_nodes.insert(node_id as u8, (my_mac, now));
             if let Some(ref s) = shared {
-                s.global_live_nodes.lock().unwrap().insert(node_id as u8, now);
+                s.global_live_nodes.lock().unwrap().insert(node_id as u8, (my_mac, now));
             }
         }
 
         // True Self-Healing: Data Rescue Operation
         for i in 1..=total_nodes {
             if i == node_id { continue; }
-            let is_alive = if let Some(&time) = live_nodes.get(&(i as u8)) {
+            let is_alive = if let Some(&(_, time)) = live_nodes.get(&(i as u8)) {
                 now.duration_since(time) < Duration::from_millis(500)
             } else { false };
             
@@ -236,13 +228,14 @@ fn spawn_node(interface_name: String, node_id: u32, total_nodes: u32, shared: Op
 
                         match packet {
                             Packet::Heartbeat { origin_mac } => {
-                                live_nodes.insert(origin_mac, now);
+                                let sender_mac = eth.get_source();
+                                live_nodes.insert(origin_mac, (sender_mac, now));
                                 if let Some(ref s) = shared {
-                                    s.global_live_nodes.lock().unwrap().insert(origin_mac, now);
+                                    s.global_live_nodes.lock().unwrap().insert(origin_mac, (sender_mac, now));
                                 }
                             }
                             Packet::Data { key, chunk_index, total_chunks, data, epoch } => {
-                                if dest == my_mac {
+                                if dest == my_mac || dest == MacAddr::broadcast() {
                                     let map_key = (key.clone(), chunk_index);
                                     if let Some(&highest) = seen_epochs.get(&map_key) {
                                         if epoch < highest { continue; }
@@ -251,7 +244,8 @@ fn spawn_node(interface_name: String, node_id: u32, total_nodes: u32, shared: Op
 
                                     if let Some(&(origin_node, _)) = recent_queries.get(&key) {
                                         let response = Packet::Response { key: key.clone(), chunk_index, total_chunks, data: data.clone(), epoch };
-                                        send_l2_packet(&mut tx, my_mac, get_mac(origin_node as u32), &response);
+                                        let target_mac = live_nodes.get(&origin_node).map(|(m, _)| *m).unwrap_or(MacAddr::broadcast());
+                                        send_l2_packet(&mut tx, my_mac, target_mac, &response);
                                     }
 
                                     recent_data.insert(map_key, (data.clone(), total_chunks, epoch, now));
@@ -260,11 +254,12 @@ fn spawn_node(interface_name: String, node_id: u32, total_nodes: u32, shared: Op
                                 }
                             }
                             Packet::Query { key, origin_mac, mut ttl } => {
-                                if dest == my_mac {
+                                if dest == my_mac || dest == MacAddr::broadcast() {
                                     for ((k, chunk_idx), (data, total_chunks, epoch, _)) in recent_data.iter() {
                                         if k == &key {
                                             let response = Packet::Response { key: key.clone(), chunk_index: *chunk_idx, total_chunks: *total_chunks, data: data.clone(), epoch: *epoch };
-                                            send_l2_packet(&mut tx, my_mac, get_mac(origin_mac as u32), &response);
+                                            let target_mac = live_nodes.get(&origin_mac).map(|(m, _)| *m).unwrap_or(MacAddr::broadcast());
+                                            send_l2_packet(&mut tx, my_mac, target_mac, &response);
                                         }
                                     }
 
@@ -277,7 +272,7 @@ fn spawn_node(interface_name: String, node_id: u32, total_nodes: u32, shared: Op
                                 }
                             }
                             Packet::Response { key, chunk_index, total_chunks, data, .. } => {
-                                if dest == my_mac {
+                                if dest == my_mac || dest == MacAddr::broadcast() {
                                     if let Some(ref s) = shared {
                                         let mut map = s.http_responses.lock().unwrap();
                                         let entry = map.entry(key).or_insert_with(|| (HashMap::new(), total_chunks));
@@ -411,7 +406,7 @@ fn main() {
         _ => panic!("Need Ethernet channel"),
     };
     
-    let node1_mac = get_mac(1);
+    let node1_mac = interface.mac.expect("Interface must have a hardware MAC address");
 
     println!("Gateway orchestrated. L2 rings operational. Warming up hardware...");
     thread::sleep(Duration::from_millis(1000));
@@ -520,7 +515,7 @@ fn main() {
             let map = shared.global_live_nodes.lock().unwrap();
             let mut dead_nodes = Vec::new();
             for i in 1..=total_nodes {
-                let is_alive = if let Some(&time) = map.get(&(i as u8)) {
+                let is_alive = if let Some(&(_, time)) = map.get(&(i as u8)) {
                     Instant::now().duration_since(time) < Duration::from_millis(500)
                 } else { false };
                 if !is_alive && i != 1 { dead_nodes.push(i as u8); }
