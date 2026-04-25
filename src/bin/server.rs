@@ -223,9 +223,10 @@ fn spawn_node(interface_name: String, node_id: u32, total_nodes: u32, shared: Op
         }
 
         // Biological Self-Healing: Packet Cloning for In-Flight Drops
+        // Threshold is 700ms — aggressive enough to recover drops, passive enough to not flood the channel
         let mut to_regenerate = Vec::new();
         for ((k, chunk_idx), (data, total_chunks, epoch, time)) in recent_data.iter() {
-            if now.duration_since(*time) > Duration::from_millis(200) && now.duration_since(*time) < HISTORY_DURATION {
+            if now.duration_since(*time) > Duration::from_millis(700) && now.duration_since(*time) < HISTORY_DURATION {
                 to_regenerate.push((k.clone(), *chunk_idx, data.clone(), *total_chunks, *epoch));
             }
         }
@@ -273,9 +274,6 @@ fn spawn_node(interface_name: String, node_id: u32, total_nodes: u32, shared: Op
 
                                     recent_data.insert(map_key, (data.clone(), total_chunks, epoch, now));
                                     let new_packet = Packet::Data { key, chunk_index, total_chunks, data, epoch };
-                                    
-                                    // Hardware Throttle: Prevent Wi-Fi AP Queue Exhaustion (Network Storms)
-                                    thread::sleep(Duration::from_millis(1));
                                     send_l2_packet(&mut tx, my_mac, data_next_mac, &new_packet);
                                 }
                             }
