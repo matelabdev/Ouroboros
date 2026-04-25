@@ -1,0 +1,538 @@
+use pnet::datalink::{self, Channel, MacAddr};
+use pnet::packet::ethernet::{EtherType, EthernetPacket, MutableEthernetPacket};
+use pnet::packet::Packet as PnetPacket;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::env;
+use std::fs;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tiny_http::{Header, Response, Server};
+use urlencoding::decode;
+
+const IMPACT_ETHERTYPE: EtherType = EtherType(0x88B5);
+const TOTAL_NODES: u32 = 3;
+const HISTORY_DURATION: Duration = Duration::from_millis(1000);
+const DEFAULT_TTL: u8 = 10;
+const MAX_CHUNK_SIZE: usize = 1000;
+
+#[derive(Debug, Clone)]
+enum Packet {
+    Data { key: String, chunk_index: u16, total_chunks: u16, data: Vec<u8>, epoch: u32 },
+    Query { key: String, origin_mac: u8, ttl: u8 },
+    Response { key: String, chunk_index: u16, total_chunks: u16, data: Vec<u8>, epoch: u32 },
+    Heartbeat { origin_mac: u8 },
+}
+
+impl Packet {
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        match self {
+            Packet::Data { key, chunk_index, total_chunks, data, epoch } => {
+                buf.push(0);
+                buf.push(key.len() as u8);
+                buf.extend_from_slice(key.as_bytes());
+                buf.extend_from_slice(&epoch.to_be_bytes());
+                buf.extend_from_slice(&chunk_index.to_be_bytes());
+                buf.extend_from_slice(&total_chunks.to_be_bytes());
+                buf.extend_from_slice(&(data.len() as u16).to_be_bytes());
+                buf.extend_from_slice(data);
+            }
+            Packet::Query { key, origin_mac, ttl } => {
+                buf.push(1);
+                buf.push(key.len() as u8);
+                buf.extend_from_slice(key.as_bytes());
+                buf.push(*origin_mac);
+                buf.push(*ttl);
+            }
+            Packet::Response { key, chunk_index, total_chunks, data, epoch } => {
+                buf.push(2);
+                buf.push(key.len() as u8);
+                buf.extend_from_slice(key.as_bytes());
+                buf.extend_from_slice(&epoch.to_be_bytes());
+                buf.extend_from_slice(&chunk_index.to_be_bytes());
+                buf.extend_from_slice(&total_chunks.to_be_bytes());
+                buf.extend_from_slice(&(data.len() as u16).to_be_bytes());
+                buf.extend_from_slice(data);
+            }
+            Packet::Heartbeat { origin_mac } => {
+                buf.push(3);
+                buf.push(*origin_mac);
+            }
+        }
+        buf
+    }
+
+    fn from_bytes(buf: &[u8]) -> Option<Self> {
+        if buf.is_empty() { return None; }
+        let packet_type = buf[0];
+        
+        if packet_type == 3 {
+            if buf.len() < 2 { return None; }
+            return Some(Packet::Heartbeat { origin_mac: buf[1] });
+        }
+
+        let k_len = buf[1] as usize;
+        if buf.len() < 2 + k_len { return None; }
+        
+        let key = String::from_utf8(buf[2..2+k_len].to_vec()).unwrap_or_default();
+        let offset = 2 + k_len;
+
+        match packet_type {
+            0 | 2 => {
+                if buf.len() < offset + 10 { return None; }
+                let epoch = u32::from_be_bytes(buf[offset..offset+4].try_into().unwrap());
+                let chunk_index = u16::from_be_bytes(buf[offset+4..offset+6].try_into().unwrap());
+                let total_chunks = u16::from_be_bytes(buf[offset+6..offset+8].try_into().unwrap());
+                let v_len = u16::from_be_bytes(buf[offset+8..offset+10].try_into().unwrap()) as usize;
+                
+                if buf.len() < offset + 10 + v_len { return None; }
+                let data = buf[offset+10..offset+10+v_len].to_vec();
+                
+                if packet_type == 0 {
+                    Some(Packet::Data { key, chunk_index, total_chunks, data, epoch })
+                } else {
+                    Some(Packet::Response { key, chunk_index, total_chunks, data, epoch })
+                }
+            }
+            1 => {
+                if buf.len() < offset + 2 { return None; }
+                let origin_mac = buf[offset];
+                let ttl = buf[offset+1];
+                Some(Packet::Query { key, origin_mac, ttl })
+            }
+            _ => None,
+        }
+    }
+}
+
+fn get_mac(node_id: u32) -> MacAddr {
+    MacAddr::new(2, 0, 0, 0, 0, node_id as u8)
+}
+
+fn get_next_alive(current: u32, live_nodes: &HashMap<u8, Instant>, forward: bool) -> MacAddr {
+    let mut next = current;
+    for _ in 0..TOTAL_NODES {
+        next = if forward {
+            if next == TOTAL_NODES { 1 } else { next + 1 }
+        } else {
+            if next == 1 { TOTAL_NODES } else { next - 1 }
+        };
+        
+        if next == current { break; }
+        
+        if let Some(&time) = live_nodes.get(&(next as u8)) {
+            if Instant::now().duration_since(time) < Duration::from_millis(500) {
+                return get_mac(next);
+            }
+        }
+    }
+    // Fallback if no heartbeats seen yet
+    get_mac(if forward {
+        if current == TOTAL_NODES { 1 } else { current + 1 }
+    } else {
+        if current == 1 { TOTAL_NODES } else { current - 1 }
+    })
+}
+
+fn send_l2_packet(tx: &mut Box<dyn datalink::DataLinkSender>, my_mac: MacAddr, dest_mac: MacAddr, packet: &Packet) {
+    let payload = packet.to_bytes();
+    let frame_size = std::cmp::max(60, 14 + payload.len());
+    let mut ethernet_buffer = vec![0u8; frame_size];
+    let mut eth_packet = MutableEthernetPacket::new(&mut ethernet_buffer).unwrap();
+    eth_packet.set_destination(dest_mac);
+    eth_packet.set_source(my_mac);
+    eth_packet.set_ethertype(IMPACT_ETHERTYPE);
+    eth_packet.set_payload(&payload);
+    tx.send_to(eth_packet.packet(), None);
+}
+
+#[derive(Serialize, Deserialize)]
+struct SnapshotItem {
+    key: String,
+    value: String,
+}
+
+struct SharedState {
+    http_responses: Mutex<HashMap<String, (HashMap<u16, Vec<u8>>, u16)>>,
+    active_data_count: Mutex<usize>,
+    global_live_nodes: Mutex<HashMap<u8, Instant>>,
+}
+
+#[derive(Serialize)]
+struct StatsResponse {
+    active_packets: usize,
+    capacity_limit_warning: bool,
+    dead_nodes: Vec<u8>,
+}
+
+fn spawn_node(interface_name: String, node_id: u32, shared: Arc<SharedState>, enable_snapshots: bool, kill_switch: Arc<Mutex<bool>>) {
+    let interfaces = datalink::interfaces();
+    let interface = interfaces.into_iter().find(|i| i.name == interface_name).expect("Interface not found");
+
+    let my_mac = get_mac(node_id);
+    let mut config = datalink::Config::default();
+    config.read_timeout = Some(Duration::from_millis(10));
+
+    let (mut tx, mut rx) = match datalink::channel(&interface, config) {
+        Ok(Channel::Ethernet(tx, rx)) => (tx, rx),
+        _ => panic!("Need Ethernet channel"),
+    };
+
+    let mut seen_epochs = HashMap::<(String, u16), u32>::new();
+    let mut recent_data = HashMap::<(String, u16), (Vec<u8>, u16, u32, Instant)>::new();
+    let mut recent_queries = HashMap::<String, (u8, Instant)>::new();
+    let mut live_nodes = HashMap::<u8, Instant>::new();
+    let mut known_dead = HashMap::<u8, bool>::new();
+
+    let mut last_cleanup = Instant::now();
+    let mut last_snapshot = Instant::now();
+    let mut last_heartbeat = Instant::now();
+
+    loop {
+        if *kill_switch.lock().unwrap() {
+            thread::sleep(Duration::from_millis(100));
+            continue; // CRASH SIMULATION! Node stops all L2 processing.
+        }
+
+        let now = Instant::now();
+        
+        // Broadcast Heartbeat
+        if now.duration_since(last_heartbeat) > Duration::from_millis(100) {
+            let hb = Packet::Heartbeat { origin_mac: node_id as u8 };
+            send_l2_packet(&mut tx, my_mac, MacAddr::broadcast(), &hb);
+            last_heartbeat = now;
+            live_nodes.insert(node_id as u8, now);
+            if node_id == 1 {
+                shared.global_live_nodes.lock().unwrap().insert(node_id as u8, now);
+            }
+        }
+
+        // True Self-Healing: Data Rescue Operation
+        for i in 1..=TOTAL_NODES {
+            if i == node_id { continue; }
+            let is_alive = if let Some(&time) = live_nodes.get(&(i as u8)) {
+                now.duration_since(time) < Duration::from_millis(500)
+            } else { false };
+            
+            if !is_alive && !known_dead.contains_key(&(i as u8)) {
+                // Node just died! Trigger Rescue Operation.
+                known_dead.insert(i as u8, true);
+                let data_next_mac = get_next_alive(node_id, &live_nodes, true);
+                for ((k, chunk_idx), (data, total_chunks, epoch, _)) in recent_data.iter() {
+                    let rescue_packet = Packet::Data { key: k.clone(), chunk_index: *chunk_idx, total_chunks: *total_chunks, data: data.clone(), epoch: *epoch };
+                    send_l2_packet(&mut tx, my_mac, data_next_mac, &rescue_packet);
+                }
+            } else if is_alive {
+                known_dead.remove(&(i as u8));
+            }
+        }
+
+        if let Ok(frame) = rx.next() {
+            if let Some(eth) = EthernetPacket::new(frame) {
+                let dest = eth.get_destination();
+                if eth.get_ethertype() == IMPACT_ETHERTYPE && (dest == my_mac || dest == MacAddr::broadcast()) {
+                    if let Some(packet) = Packet::from_bytes(eth.payload()) {
+                        let now = Instant::now();
+                        
+                        let data_next_mac = get_next_alive(node_id, &live_nodes, true);
+                        let query_next_mac = get_next_alive(node_id, &live_nodes, false);
+
+                        match packet {
+                            Packet::Heartbeat { origin_mac } => {
+                                live_nodes.insert(origin_mac, now);
+                                if node_id == 1 {
+                                    shared.global_live_nodes.lock().unwrap().insert(origin_mac, now);
+                                }
+                            }
+                            Packet::Data { key, chunk_index, total_chunks, data, epoch } => {
+                                if dest == my_mac {
+                                    let map_key = (key.clone(), chunk_index);
+                                    if let Some(&highest) = seen_epochs.get(&map_key) {
+                                        if epoch < highest { continue; }
+                                    }
+                                    seen_epochs.insert(map_key.clone(), epoch);
+
+                                    if let Some(&(origin_node, _)) = recent_queries.get(&key) {
+                                        let response = Packet::Response { key: key.clone(), chunk_index, total_chunks, data: data.clone(), epoch };
+                                        send_l2_packet(&mut tx, my_mac, get_mac(origin_node as u32), &response);
+                                    }
+
+                                    recent_data.insert(map_key, (data.clone(), total_chunks, epoch, now));
+                                    let new_packet = Packet::Data { key, chunk_index, total_chunks, data, epoch };
+                                    send_l2_packet(&mut tx, my_mac, data_next_mac, &new_packet);
+                                }
+                            }
+                            Packet::Query { key, origin_mac, mut ttl } => {
+                                if dest == my_mac {
+                                    for ((k, chunk_idx), (data, total_chunks, epoch, _)) in recent_data.iter() {
+                                        if k == &key {
+                                            let response = Packet::Response { key: key.clone(), chunk_index: *chunk_idx, total_chunks: *total_chunks, data: data.clone(), epoch: *epoch };
+                                            send_l2_packet(&mut tx, my_mac, get_mac(origin_mac as u32), &response);
+                                        }
+                                    }
+
+                                    recent_queries.insert(key.clone(), (origin_mac, now));
+                                    ttl -= 1;
+                                    if ttl > 0 {
+                                        let new_packet = Packet::Query { key, origin_mac, ttl };
+                                        send_l2_packet(&mut tx, my_mac, query_next_mac, &new_packet);
+                                    }
+                                }
+                            }
+                            Packet::Response { key, chunk_index, total_chunks, data, .. } => {
+                                if dest == my_mac {
+                                    if node_id == 1 {
+                                        let mut map = shared.http_responses.lock().unwrap();
+                                        let entry = map.entry(key).or_insert_with(|| (HashMap::new(), total_chunks));
+                                        entry.0.insert(chunk_index, data);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let now = Instant::now();
+        if now.duration_since(last_cleanup) > Duration::from_millis(5) {
+            recent_data.retain(|_, (_, _, _, time)| now.duration_since(*time) < HISTORY_DURATION);
+            recent_queries.retain(|_, (_, time)| now.duration_since(*time) < HISTORY_DURATION);
+            
+            if node_id == 1 {
+                *shared.active_data_count.lock().unwrap() = recent_data.len();
+            }
+            last_cleanup = now;
+        }
+
+        if enable_snapshots && node_id == 1 && now.duration_since(last_snapshot) > Duration::from_secs(10) {
+            let mut assembled = HashMap::<String, (HashMap<u16, Vec<u8>>, u16)>::new();
+            for ((k, chunk_idx), (data, total_chunks, _, _)) in recent_data.iter() {
+                let entry = assembled.entry(k.clone()).or_insert_with(|| (HashMap::new(), *total_chunks));
+                entry.0.insert(*chunk_idx, data.clone());
+            }
+
+            let mut items = Vec::new();
+            for (k, (chunks_map, total_chunks)) in assembled {
+                if chunks_map.len() == total_chunks as usize {
+                    let mut full_data = Vec::new();
+                    for i in 0..total_chunks {
+                        if let Some(chunk) = chunks_map.get(&i) {
+                            full_data.extend_from_slice(chunk);
+                        }
+                    }
+                    if let Ok(value) = String::from_utf8(full_data) {
+                        items.push(SnapshotItem { key: k, value });
+                    }
+                }
+            }
+
+            if let Ok(json) = serde_json::to_string(&items) {
+                let _ = fs::write("impactdb_snapshot.json", json);
+            }
+            last_snapshot = now;
+        }
+    }
+}
+
+fn inject_string_payload(web_tx: &mut Box<dyn datalink::DataLinkSender>, node1_mac: MacAddr, dest_mac: MacAddr, key: String, value: String) {
+    let bytes = value.into_bytes();
+    let total_chunks = (bytes.len() as f64 / MAX_CHUNK_SIZE as f64).ceil() as u16;
+    let total_chunks = if total_chunks == 0 { 1 } else { total_chunks };
+    let epoch = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u32;
+
+    if bytes.is_empty() {
+        let p = Packet::Data { key, chunk_index: 0, total_chunks: 1, data: vec![], epoch };
+        send_l2_packet(web_tx, node1_mac, dest_mac, &p);
+        return;
+    }
+
+    for i in 0..total_chunks {
+        let start = (i as usize) * MAX_CHUNK_SIZE;
+        let end = std::cmp::min(start + MAX_CHUNK_SIZE, bytes.len());
+        let chunk_data = bytes[start..end].to_vec();
+        
+        let p = Packet::Data { key: key.clone(), chunk_index: i, total_chunks, data: chunk_data, epoch };
+        send_l2_packet(web_tx, node1_mac, dest_mac, &p);
+        thread::sleep(Duration::from_micros(10)); 
+    }
+}
+
+fn main() {
+    let args: Vec<String> = env::args().collect();
+    if args.len() < 2 {
+        eprintln!("Usage: sudo cargo run --bin server <INTERFACE_NAME> [--snapshots]");
+        std::process::exit(1);
+    }
+    let interface_name = args[1].clone();
+    let enable_snapshots = args.contains(&"--snapshots".to_string());
+
+    let shared = Arc::new(SharedState {
+        http_responses: Mutex::new(HashMap::new()),
+        active_data_count: Mutex::new(0),
+        global_live_nodes: Mutex::new(HashMap::new()),
+    });
+
+    println!("Starting impactDB L2 Cluster on interface {}...", interface_name);
+    
+    let interfaces = datalink::interfaces();
+    let interface = interfaces.into_iter().find(|i| i.name == interface_name).expect("Interface not found");
+    let mut config = datalink::Config::default();
+    config.read_timeout = Some(Duration::from_millis(10));
+    let mut web_tx = match datalink::channel(&interface, config) {
+        Ok(Channel::Ethernet(tx, _)) => tx,
+        _ => panic!("Need Ethernet channel"),
+    };
+    
+    let node1_mac = get_mac(1);
+    
+    let mut kill_switches = HashMap::new();
+
+    for i in 1..=TOTAL_NODES {
+        let iface = interface_name.clone();
+        let s = Arc::clone(&shared);
+        let snaps = enable_snapshots;
+        let ks = Arc::new(Mutex::new(false));
+        kill_switches.insert(i, Arc::clone(&ks));
+        thread::spawn(move || spawn_node(iface, i, s, snaps, ks));
+    }
+
+    println!("Cluster orchestrated. L2 rings operational. Warming up hardware...");
+    thread::sleep(Duration::from_millis(1000));
+
+    if enable_snapshots {
+        if let Ok(data) = fs::read_to_string("impactdb_snapshot.json") {
+            if let Ok(items) = serde_json::from_str::<Vec<SnapshotItem>>(&data) {
+                println!("Restoring {} items from snapshot...", items.len());
+                for item in items {
+                    let map = shared.global_live_nodes.lock().unwrap();
+                    let dest_mac = get_next_alive(1, &*map, true);
+                    drop(map);
+                    inject_string_payload(&mut web_tx, node1_mac, dest_mac, item.key, item.value);
+                }
+                println!("Snapshot restoration complete.");
+            }
+        }
+    }
+
+    println!("Starting Web Dashboard on http://localhost:3000");
+
+    let server = Server::http("0.0.0.0:3000").unwrap();
+    let html = include_str!("index.html");
+
+    for request in server.incoming_requests() {
+        let url = request.url().to_string();
+        
+        if url == "/" {
+            let response = Response::from_string(html).with_header(Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap());
+            request.respond(response).unwrap();
+        } else if url.starts_with("/api/set") {
+            if let Some((_, query)) = url.split_once('?') {
+                let parts: Vec<&str> = query.split('&').collect();
+                let mut k = String::new(); let mut v = String::new();
+                for part in parts {
+                    if let Some((k_str, v_str)) = part.split_once('=') {
+                        if k_str == "k" { k = decode(v_str).unwrap_or_default().to_string(); }
+                        if k_str == "v" { v = decode(v_str).unwrap_or_default().to_string(); }
+                    }
+                }
+                
+                let map = shared.global_live_nodes.lock().unwrap();
+                let data_next_mac = get_next_alive(1, &*map, true);
+                drop(map);
+
+                let start = Instant::now();
+                inject_string_payload(&mut web_tx, node1_mac, data_next_mac, k, v);
+                let latency = start.elapsed().as_micros();
+                request.respond(Response::from_string(format!("{{\"status\":\"ok\",\"latency_us\":{}}}", latency))).unwrap();
+            }
+        } else if url.starts_with("/api/get") {
+            if let Some((_, query)) = url.split_once('?') {
+                if let Some(kv) = query.split('=').collect::<Vec<&str>>().get(1) {
+                    let key = decode(kv).unwrap_or_default().to_string();
+                    let start = Instant::now();
+                    
+                    shared.http_responses.lock().unwrap().remove(&key);
+
+                    let map = shared.global_live_nodes.lock().unwrap();
+                    let query_next_mac = get_next_alive(1, &*map, false);
+                    drop(map);
+
+                    let p = Packet::Query { key: key.clone(), origin_mac: 1, ttl: DEFAULT_TTL };
+                    send_l2_packet(&mut web_tx, node1_mac, query_next_mac, &p);
+                    
+                    let mut assembled_value = None;
+                    let wait_start = Instant::now();
+
+                    while wait_start.elapsed() < Duration::from_secs(2) {
+                        let map = shared.http_responses.lock().unwrap();
+                        if let Some((chunks_map, total_chunks)) = map.get(&key) {
+                            if chunks_map.len() == *total_chunks as usize {
+                                let mut full_data = Vec::new();
+                                for i in 0..*total_chunks {
+                                    if let Some(chunk) = chunks_map.get(&i) {
+                                        full_data.extend_from_slice(chunk);
+                                    }
+                                }
+                                if let Ok(s) = String::from_utf8(full_data) {
+                                    assembled_value = Some(s);
+                                    break;
+                                }
+                            }
+                        }
+                        drop(map);
+                        thread::sleep(Duration::from_micros(50));
+                    }
+                    
+                    let latency = start.elapsed().as_micros();
+                    if let Some(v) = assembled_value {
+                        let json = serde_json::json!({
+                            "value": v,
+                            "latency_us": latency
+                        });
+                        request.respond(Response::from_string(json.to_string())).unwrap();
+                    } else {
+                        request.respond(Response::from_string("{\"error\":\"Not Found or Dropped\"}")).unwrap();
+                    }
+                }
+            }
+        } else if url.starts_with("/api/kill") {
+            if let Some((_, query)) = url.split_once('?') {
+                let parts: Vec<&str> = query.split('=').collect();
+                if parts.len() == 2 && parts[0] == "node" {
+                    if let Ok(n) = parts[1].parse::<u32>() {
+                        if let Some(ks) = kill_switches.get(&n) {
+                            *ks.lock().unwrap() = true;
+                            request.respond(Response::from_string(format!("{{\"status\":\"Node {} Killed\"}}", n))).unwrap();
+                            continue;
+                        }
+                    }
+                }
+            }
+        } else if url == "/api/stats" {
+            let count = *shared.active_data_count.lock().unwrap();
+            
+            let map = shared.global_live_nodes.lock().unwrap();
+            let mut dead_nodes = Vec::new();
+            for i in 1..=TOTAL_NODES {
+                let is_alive = if let Some(&time) = map.get(&(i as u8)) {
+                    Instant::now().duration_since(time) < Duration::from_millis(500)
+                } else { false };
+                if !is_alive { dead_nodes.push(i as u8); }
+            }
+            drop(map);
+
+            let stats = StatsResponse {
+                active_packets: count,
+                capacity_limit_warning: count > 800,
+                dead_nodes,
+            };
+            let json = serde_json::to_string(&stats).unwrap();
+            request.respond(Response::from_string(json)).unwrap();
+        } else {
+            request.respond(Response::from_string("404")).unwrap();
+        }
+    }
+}
