@@ -24,6 +24,7 @@ enum Packet {
     Query { key: String, origin_mac: u8, ttl: u8 },
     Response { key: String, chunk_index: u16, total_chunks: u16, data: Vec<u8>, epoch: u32 },
     Heartbeat { origin_mac: u8 },
+    Delete { key: String, origin_mac: u8 },
 }
 
 impl Packet {
@@ -59,6 +60,12 @@ impl Packet {
             }
             Packet::Heartbeat { origin_mac } => {
                 buf.push(3);
+                buf.push(*origin_mac);
+            }
+            Packet::Delete { key, origin_mac } => {
+                buf.push(4);
+                buf.push(key.len() as u8);
+                buf.extend_from_slice(key.as_bytes());
                 buf.push(*origin_mac);
             }
         }
@@ -102,6 +109,11 @@ impl Packet {
                 let origin_mac = buf[offset];
                 let ttl = buf[offset+1];
                 Some(Packet::Query { key, origin_mac, ttl })
+            }
+            4 => {
+                if buf.len() < offset + 1 { return None; }
+                let origin_mac = buf[offset];
+                Some(Packet::Delete { key, origin_mac })
             }
             _ => None,
         }
@@ -339,6 +351,15 @@ fn spawn_node(interface_name: String, node_id: u32, shared: Option<Arc<SharedSta
                                     }
                                 }
                             }
+                            Packet::Delete { key, origin_mac } => {
+                                if dest == my_mac || dest == MacAddr::broadcast() {
+                                    recent_data.retain(|(k, _), _| k != &key);
+                                    if origin_mac != node_id as u8 {
+                                        let new_packet = Packet::Delete { key, origin_mac };
+                                        send_l2_packet(&mut tx, my_mac, data_next_mac, &new_packet);
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -492,6 +513,19 @@ fn start_tcp_ipc(interface_name: String, node_id: u32, use_virtual_mac: bool, sh
                                     let dest = get_next_alive(node_id, &*map, true);
                                     drop(map);
                                     inject_string_payload(&mut tx_box, my_mac, dest, key, value);
+                                    let _ = stream.write_all(b"+OK\n");
+                                }
+                            }
+                            "DEL" | "FORGET" => {
+                                if parts.len() < 2 {
+                                    let _ = stream.write_all(b"-ERR missing key\n");
+                                } else {
+                                    let key = parts[1].to_string();
+                                    let map = shared.global_live_nodes.lock().unwrap();
+                                    let dest = get_next_alive(node_id, &*map, true);
+                                    drop(map);
+                                    let p = Packet::Delete { key, origin_mac: node_id as u8 };
+                                    send_l2_packet(&mut tx_box, my_mac, dest, &p);
                                     let _ = stream.write_all(b"+OK\n");
                                 }
                             }
@@ -767,6 +801,20 @@ fn main() {
                 inject_string_payload(&mut web_tx, node1_mac, data_next_mac, k, v);
                 let latency = start.elapsed().as_micros();
                 request.respond(Response::from_string(format!("{{\"status\":\"ok\",\"latency_us\":{}}}", latency))).unwrap();
+            }
+        } else if url.starts_with("/api/del") {
+            if let Some((_, query)) = url.split_once('?') {
+                if let Some(kv) = query.split('=').collect::<Vec<&str>>().get(1) {
+                    let key = decode(kv).unwrap_or_default().to_string();
+                    let map = shared.global_live_nodes.lock().unwrap();
+                    let data_next_mac = get_next_alive(1, &*map, true);
+                    drop(map);
+
+                    let p = Packet::Delete { key, origin_mac: 1 };
+                    send_l2_packet(&mut web_tx, node1_mac, data_next_mac, &p);
+                    
+                    request.respond(Response::from_string("{\"status\":\"ok\"}")).unwrap();
+                }
             }
         } else if url.starts_with("/api/get") {
             if let Some((_, query)) = url.split_once('?') {
