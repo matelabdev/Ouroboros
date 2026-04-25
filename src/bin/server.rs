@@ -12,6 +12,13 @@ use std::net::TcpListener;
 use std::io::{Write, BufReader, BufRead};
 use tiny_http::{Header, Response, Server};
 use urlencoding::decode;
+use chacha20poly1305::{
+    aead::{Aead, KeyInit},
+    ChaCha20Poly1305, Nonce
+};
+use rand::{RngCore, thread_rng};
+use std::hash::{Hash, Hasher};
+use std::collections::hash_map::DefaultHasher;
 
 const OUROBOROS_ETHERTYPE: EtherType = EtherType(0x88B5);
 const HISTORY_DURATION: Duration = Duration::from_millis(1000);
@@ -120,6 +127,48 @@ impl Packet {
     }
 }
 
+struct Crypto {
+    cipher: ChaCha20Poly1305,
+}
+
+impl Crypto {
+    fn new(secret: &str) -> Self {
+        let mut hasher = DefaultHasher::new();
+        secret.hash(&mut hasher);
+        let h = hasher.finish();
+        let mut key = [0u8; 32];
+        // Simple key derivation from hash
+        for i in 0..8 {
+            let bytes = h.to_be_bytes();
+            key[i] = bytes[i];
+            key[i+8] = bytes[i] ^ 0xAA;
+            key[i+16] = bytes[i] ^ 0x55;
+            key[i+24] = bytes[i] ^ 0xFF;
+        }
+        let cipher = ChaCha20Poly1305::new(&key.into());
+        Self { cipher }
+    }
+
+    fn encrypt(&self, plaintext: &[u8]) -> Vec<u8> {
+        let mut nonce_bytes = [0u8; 12];
+        thread_rng().fill_bytes(&mut nonce_bytes);
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let ciphertext = self.cipher.encrypt(nonce, plaintext).expect("encryption failure");
+        
+        let mut result = Vec::with_capacity(12 + ciphertext.len());
+        result.extend_from_slice(&nonce_bytes);
+        result.extend_from_slice(&ciphertext);
+        result
+    }
+
+    fn decrypt(&self, payload: &[u8]) -> Option<Vec<u8>> {
+        if payload.len() < 12 { return None; }
+        let nonce = Nonce::from_slice(&payload[..12]);
+        let ciphertext = &payload[12..];
+        self.cipher.decrypt(nonce, ciphertext).ok()
+    }
+}
+
 fn get_mac(node_id: u32) -> MacAddr {
     MacAddr::new(2, 0, 0, 0, 0, node_id as u8)
 }
@@ -177,6 +226,7 @@ struct SharedState {
     active_data_count: Mutex<usize>,
     global_live_nodes: Mutex<HashMap<u8, (MacAddr, Instant)>>,
     all_keys: Mutex<Vec<String>>,
+    encryption_key: Option<String>,
 }
 
 fn matches_pattern(key: &str, pattern: &str) -> bool {
@@ -219,6 +269,8 @@ fn spawn_node(interface_name: String, node_id: u32, shared: Option<Arc<SharedSta
     
     let mut config = datalink::Config::default();
     config.read_timeout = Some(Duration::from_millis(10));
+
+    let crypto = shared.as_ref().and_then(|s| s.encryption_key.as_ref().map(|k| Crypto::new(k)));
 
     let (mut tx, mut rx) = match datalink::channel(&interface, config) {
         Ok(Channel::Ethernet(tx, rx)) => (tx, rx),
@@ -305,8 +357,16 @@ fn spawn_node(interface_name: String, node_id: u32, shared: Option<Arc<SharedSta
                                     s.global_live_nodes.lock().unwrap().insert(origin_mac, (sender_mac, now));
                                 }
                             }
-                            Packet::Data { key, chunk_index, total_chunks, data, epoch } => {
+                            Packet::Data { key, chunk_index, total_chunks, mut data, epoch } => {
                                 if dest == my_mac || dest == MacAddr::broadcast() {
+                                    if let Some(c) = crypto.as_ref() {
+                                        if let Some(decrypted) = c.decrypt(&data) {
+                                            data = decrypted;
+                                        } else {
+                                            continue;
+                                        }
+                                    }
+
                                     let map_key = (key.clone(), chunk_index);
                                     if let Some(&highest) = seen_epochs.get(&map_key) {
                                         if epoch < highest { continue; }
@@ -314,13 +374,22 @@ fn spawn_node(interface_name: String, node_id: u32, shared: Option<Arc<SharedSta
                                     seen_epochs.insert(map_key.clone(), epoch);
 
                                     if let Some(&(origin_node, _)) = recent_queries.get(&key) {
-                                        let response = Packet::Response { key: key.clone(), chunk_index, total_chunks, data: data.clone(), epoch };
+                                        let mut resp_data = data.clone();
+                                        if let Some(c) = crypto.as_ref() {
+                                            resp_data = c.encrypt(&resp_data);
+                                        }
+                                        let response = Packet::Response { key: key.clone(), chunk_index, total_chunks, data: resp_data, epoch };
                                         let target_mac = live_nodes.get(&origin_node).map(|(m, _)| *m).unwrap_or(MacAddr::broadcast());
                                         send_l2_packet(&mut tx, my_mac, target_mac, &response);
                                     }
 
                                     recent_data.insert(map_key, (data.clone(), total_chunks, epoch, now));
-                                    let new_packet = Packet::Data { key, chunk_index, total_chunks, data, epoch };
+                                    
+                                    let mut forward_data = data;
+                                    if let Some(c) = crypto.as_ref() {
+                                        forward_data = c.encrypt(&forward_data);
+                                    }
+                                    let new_packet = Packet::Data { key, chunk_index, total_chunks, data: forward_data, epoch };
                                     send_l2_packet(&mut tx, my_mac, data_next_mac, &new_packet);
                                 }
                             }
@@ -328,7 +397,11 @@ fn spawn_node(interface_name: String, node_id: u32, shared: Option<Arc<SharedSta
                                 if dest == my_mac || dest == MacAddr::broadcast() {
                                     for ((k, chunk_idx), (data, total_chunks, epoch, _)) in recent_data.iter() {
                                         if k == &key {
-                                            let response = Packet::Response { key: key.clone(), chunk_index: *chunk_idx, total_chunks: *total_chunks, data: data.clone(), epoch: *epoch };
+                                            let mut resp_data = data.clone();
+                                            if let Some(c) = crypto.as_ref() {
+                                                resp_data = c.encrypt(&resp_data);
+                                            }
+                                            let response = Packet::Response { key: key.clone(), chunk_index: *chunk_idx, total_chunks: *total_chunks, data: resp_data, epoch: *epoch };
                                             let target_mac = live_nodes.get(&origin_mac).map(|(m, _)| *m).unwrap_or(MacAddr::broadcast());
                                             send_l2_packet(&mut tx, my_mac, target_mac, &response);
                                         }
@@ -342,8 +415,15 @@ fn spawn_node(interface_name: String, node_id: u32, shared: Option<Arc<SharedSta
                                     }
                                 }
                             }
-                            Packet::Response { key, chunk_index, total_chunks, data, .. } => {
+                            Packet::Response { key, chunk_index, total_chunks, mut data, .. } => {
                                 if dest == my_mac || dest == MacAddr::broadcast() {
+                                    if let Some(c) = crypto.as_ref() {
+                                        if let Some(decrypted) = c.decrypt(&data) {
+                                            data = decrypted;
+                                        } else {
+                                            continue;
+                                        }
+                                    }
                                     if let Some(ref s) = shared {
                                         let mut map = s.http_responses.lock().unwrap();
                                         let entry = map.entry(key).or_insert_with(|| (HashMap::new(), total_chunks));
@@ -409,8 +489,12 @@ fn spawn_node(interface_name: String, node_id: u32, shared: Option<Arc<SharedSta
     }
 }
 
-fn inject_string_payload(web_tx: &mut Box<dyn datalink::DataLinkSender>, node1_mac: MacAddr, dest_mac: MacAddr, key: String, value: String) {
-    let bytes = value.into_bytes();
+fn inject_string_payload(web_tx: &mut Box<dyn datalink::DataLinkSender>, node1_mac: MacAddr, dest_mac: MacAddr, key: String, value: String, crypto: &Option<Crypto>) {
+    let mut bytes = value.into_bytes();
+    if let Some(c) = crypto.as_ref() {
+        bytes = c.encrypt(&bytes);
+    }
+    
     let total_chunks = (bytes.len() as f64 / MAX_CHUNK_SIZE as f64).ceil() as u16;
     let total_chunks = if total_chunks == 0 { 1 } else { total_chunks };
     let epoch = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u32;
@@ -452,6 +536,7 @@ fn start_tcp_ipc(interface_name: String, node_id: u32, use_virtual_mac: bool, sh
                     _ => panic!("Need Ethernet channel"),
                 };
                 let my_mac = my_mac;
+                let crypto = shared.encryption_key.as_ref().map(|k| Crypto::new(k));
                 thread::spawn(move || {
                     let mut reader = BufReader::new(stream.try_clone().unwrap());
                     let mut line = String::new();
@@ -512,7 +597,7 @@ fn start_tcp_ipc(interface_name: String, node_id: u32, use_virtual_mac: bool, sh
                                     let map = shared.global_live_nodes.lock().unwrap();
                                     let dest = get_next_alive(node_id, &*map, true);
                                     drop(map);
-                                    inject_string_payload(&mut tx_box, my_mac, dest, key, value);
+                                    inject_string_payload(&mut tx_box, my_mac, dest, key, value, &crypto);
                                     let _ = stream.write_all(b"+OK\n");
                                 }
                             }
@@ -557,6 +642,7 @@ fn main() {
     let mut total_nodes: u32 = 3;
     let mut enable_snapshots = false;
     let mut use_virtual_mac = false;
+    let mut secret = None;
 
     let args: Vec<String> = env::args().collect();
     let mut i = 1;
@@ -566,6 +652,7 @@ fn main() {
             "--total-nodes" => { i += 1; if i < args.len() { total_nodes = args[i].parse().unwrap_or(3); } }
             "--snapshots" => { enable_snapshots = true; }
             "--virtual-mac" => { use_virtual_mac = true; }
+            "--secret" => { i += 1; if i < args.len() { secret = Some(args[i].clone()); } }
             "--virutal-mac" => { 
                 eprintln!("Warning: did you mean --virtual-mac? Enabling it anyway.");
                 use_virtual_mac = true; 
@@ -603,6 +690,7 @@ fn main() {
             active_data_count: Mutex::new(0),
             global_live_nodes: Mutex::new(HashMap::new()),
             all_keys: Mutex::new(Vec::new()),
+            encryption_key: secret.clone(),
         });
 
         let iface = interface_name.clone();
@@ -694,7 +782,8 @@ fn main() {
                     let dest = get_next_alive(node_id, &*map, true);
                     drop(map);
                     let start = Instant::now();
-                    inject_string_payload(&mut relay_tx, relay_mac, dest, k, v);
+                    let crypto_gate = shared.encryption_key.as_ref().map(|k| Crypto::new(k));
+                    inject_string_payload(&mut relay_tx, relay_mac, dest, k, v, &crypto_gate);
                     let latency = start.elapsed().as_micros();
                     request.respond(Response::from_string(format!("{{\"status\":\"ok\",\"latency_us\":{}}}", latency))).unwrap();
                 }
@@ -721,6 +810,7 @@ fn main() {
         active_data_count: Mutex::new(0),
         global_live_nodes: Mutex::new(HashMap::new()),
         all_keys: Mutex::new(Vec::new()),
+        encryption_key: secret.clone(),
     });
 
     let iface = interface_name.clone();
@@ -759,7 +849,8 @@ fn main() {
                     let map = shared.global_live_nodes.lock().unwrap();
                     let dest_mac = get_next_alive(1, &*map, true);
                     drop(map);
-                    inject_string_payload(&mut web_tx, node1_mac, dest_mac, item.key, item.value);
+                    let crypto_snap = shared.encryption_key.as_ref().map(|k| Crypto::new(k));
+                    inject_string_payload(&mut web_tx, node1_mac, dest_mac, item.key, item.value, &crypto_snap);
                 }
                 println!("Snapshot restoration complete.");
             }
@@ -798,7 +889,8 @@ fn main() {
                 drop(map);
 
                 let start = Instant::now();
-                inject_string_payload(&mut web_tx, node1_mac, data_next_mac, k, v);
+                let crypto_gate = shared.encryption_key.as_ref().map(|k| Crypto::new(k));
+                inject_string_payload(&mut web_tx, node1_mac, data_next_mac, k, v, &crypto_gate);
                 let latency = start.elapsed().as_micros();
                 request.respond(Response::from_string(format!("{{\"status\":\"ok\",\"latency_us\":{}}}", latency))).unwrap();
             }
