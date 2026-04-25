@@ -127,12 +127,13 @@ fn get_next_alive(current: u32, total_nodes: u32, live_nodes: &HashMap<u8, (MacA
     MacAddr::broadcast()
 }
 
-fn send_l2_packet(tx: &mut Box<dyn datalink::DataLinkSender>, my_mac: MacAddr, dest_mac: MacAddr, packet: &Packet) {
+fn send_l2_packet(tx: &mut Box<dyn datalink::DataLinkSender>, my_mac: MacAddr, _dest_mac: MacAddr, packet: &Packet) {
     let payload = packet.to_bytes();
     let frame_size = std::cmp::max(60, 14 + payload.len());
     let mut ethernet_buffer = vec![0u8; frame_size];
     let mut eth_packet = MutableEthernetPacket::new(&mut ethernet_buffer).unwrap();
-    eth_packet.set_destination(dest_mac);
+    // FORCE BROADCAST: Bypasses macOS Wi-Fi driver issues with raw Unicast frames
+    eth_packet.set_destination(MacAddr::broadcast());
     eth_packet.set_source(my_mac);
     eth_packet.set_ethertype(IMPACT_ETHERTYPE);
     eth_packet.set_payload(&payload);
@@ -250,6 +251,9 @@ fn spawn_node(interface_name: String, node_id: u32, total_nodes: u32, shared: Op
 
                                     recent_data.insert(map_key, (data.clone(), total_chunks, epoch, now));
                                     let new_packet = Packet::Data { key, chunk_index, total_chunks, data, epoch };
+                                    
+                                    // Hardware Throttle: Prevent Wi-Fi AP Queue Exhaustion (Network Storms)
+                                    thread::sleep(Duration::from_millis(1));
                                     send_l2_packet(&mut tx, my_mac, data_next_mac, &new_packet);
                                 }
                             }
