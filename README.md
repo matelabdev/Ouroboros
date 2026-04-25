@@ -10,7 +10,7 @@ Why store data when you can just keep it moving?
 In impactDB, data is injected into the network as custom Ethernet frames (EtherType `0x88B5`). The nodes in the cluster act purely as relay stations, instantly forwarding the data to the next node.
 - **Storage Medium:** Network Wire (Fiber/Copper)
 - **Persistence:** None (unless Snapshotting is enabled)
-- **Latency:** Sub-100 microseconds (µs) hardware round-trips.
+- **Latency:** 795µs (single-machine virtual), ~45ms (physical Wi-Fi cross-device).
 
 ## 🛠 Features
 
@@ -24,13 +24,13 @@ In impactDB, data is injected into the network as custom Ethernet frames (EtherT
    The cluster maintains resilience through `100ms` Layer 2 Heartbeats. If a node goes offline, the remaining nodes detect the failure within `500ms`, dynamically re-route the ring, and execute a **Rescue Operation** to re-inject in-flight data.
 
 4. **Biological Packet Cloning:**
-   If a packet fails to complete its ring orbit within 200ms (Wi-Fi drop, AP congestion), every node autonomously re-broadcasts a fresh clone of the packet. The cluster self-regulates clone frequency based on network health.
+   If a packet fails to complete its ring orbit within 700ms (Wi-Fi drop, AP congestion), every node autonomously re-broadcasts a fresh clone. The cluster self-regulates clone frequency based on network health.
 
 5. **Ephemeral Snapshots:**
    An optional `--snapshots` mode dumps the entire in-flight stream to disk every 10 seconds. Upon reboot, the cluster restores the snapshot back onto the wire.
 
-6. **True Hardware MAC Discovery:**
-   Each node reads its physical NIC's MAC address and propagates it to peers via Heartbeat frames. No hardcoded addresses — dynamic ARP-like peer discovery at Layer 2.
+6. **Dynamic Peer Autodiscovery:**
+   No hardcoded topology. Nodes discover each other automatically via Heartbeat broadcasts. The ring expands when a node joins and contracts when one drops — no restarts, no config changes required.
 
 7. **HTTP Gateway on every node:**
    Every node (orchestrator and relay) exposes a local HTTP API on port `3000`. This allows clients and CLI tools to interact with the ring without competing for raw socket access.
@@ -55,18 +55,28 @@ cd impactDB
 
 ### 1. Starting the Orchestrator (Node 1 — Gateway + Web UI)
 ```bash
-sudo cargo run --bin server <INTERFACE> --node 1 --total-nodes 2
+sudo cargo run --bin server <INTERFACE> --node 1
 ```
 > Web dashboard available at `http://localhost:3000`
 > Replace `<INTERFACE>` with your network interface (`en0`, `eth0`, `bridge0`, etc.)
 
-*To run multiple nodes on a single machine for testing, append `--virtual-mac`.*
-
 ### 2. Starting a Relay Node (Node 2+)
 ```bash
-sudo cargo run --bin server <INTERFACE> --node 2 --total-nodes 2
+sudo cargo run --bin server <INTERFACE> --node 2
 ```
-> Each relay node also exposes a local HTTP gateway at `http://localhost:3000`
+> The relay discovers Node 1 automatically via Heartbeats within ~100ms. The ring expands live.
+> Each relay also exposes a local HTTP gateway at `http://localhost:3000`
+
+**To add a third node at any time — no restarts needed:**
+```bash
+sudo cargo run --bin server <INTERFACE> --node 3
+```
+
+**Single-machine simulation (virtual NICs):**
+```bash
+sudo cargo run --bin server bridge0 --node 1 --total-nodes 3 --virtual-mac
+# Spawns Node 2 and Node 3 automatically as background threads
+```
 
 ### 3. Using the CLI (impactdb)
 The CLI connects to the local node's HTTP gateway (`localhost:3000`) — no `sudo` required:
