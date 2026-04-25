@@ -391,6 +391,10 @@ fn main() {
             "--total-nodes" => { i += 1; if i < args.len() { total_nodes = args[i].parse().unwrap_or(3); } }
             "--snapshots" => { enable_snapshots = true; }
             "--virtual-mac" => { use_virtual_mac = true; }
+            "--virutal-mac" => { 
+                eprintln!("Warning: did you mean --virtual-mac? Enabling it anyway.");
+                use_virtual_mac = true; 
+            }
             val => {
                 if interface_name.is_empty() && !val.starts_with("--") {
                     interface_name = val.to_string();
@@ -407,7 +411,17 @@ fn main() {
 
     println!("Starting impactDB L2 Node {} on interface {} (Total Ring Size: {})", node_id, interface_name, total_nodes);
 
-    if node_id != 1 {
+    // In virtual-mac mode, Node 1 owns all relay threads — single command, full cluster
+    if use_virtual_mac && node_id == 1 {
+        for relay_id in 2..=total_nodes {
+            let iface = interface_name.clone();
+            thread::spawn(move || spawn_node(iface, relay_id, total_nodes, None, false, true));
+            println!("  Spawned virtual relay Node {} as background thread.", relay_id);
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+
+    if node_id != 1 && !use_virtual_mac {
         // Relay node: gets its own HTTP gateway on port 3000 so CLI can query locally
         let shared = Arc::new(SharedState {
             http_responses: Mutex::new(HashMap::new()),
