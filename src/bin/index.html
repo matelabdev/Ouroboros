@@ -203,6 +203,39 @@
             box-shadow: 0 0 20px var(--accent-glow);
         }
 
+        .chat-container {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            height: 300px;
+        }
+
+        .chat-messages {
+            flex: 1;
+            overflow-y: auto;
+            background: rgba(0, 0, 0, 0.4);
+            border-radius: 8px;
+            padding: 10px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            border: 1px solid var(--border);
+        }
+
+        .chat-msg {
+            font-size: 0.85rem;
+            padding: 6px 10px;
+            border-radius: 6px;
+            background: rgba(255,255,255,0.05);
+            word-break: break-all;
+        }
+
+        .chat-msg .sender {
+            font-weight: 800;
+            color: var(--accent);
+            margin-right: 6px;
+        }
+
         .ring-container {
             width: 600px;
             height: 600px;
@@ -370,6 +403,22 @@
                 </div>
             </div>
 
+            <div class="card">
+                <h3>Mesh Chat (Decentralized)</h3>
+                <div class="chat-container">
+                    <div class="chat-messages" id="chat-scroller">
+                        <div v-for="m in chatMessages" class="chat-msg">
+                            <span class="sender">{{ m.sender }}:</span>
+                            <span>{{ m.text }}</span>
+                        </div>
+                    </div>
+                    <div style="display: grid; grid-template-columns: 80px 1fr; gap: 8px;">
+                        <input type="text" v-model="chatHandle" placeholder="You">
+                        <input type="text" v-model="chatInput" @keyup.enter="sendChat" placeholder="Type a message...">
+                    </div>
+                </div>
+            </div>
+
             <div class="console" id="console">
                 <div v-for="log in logs" class="console-entry" :class="log.type">
                     {{ log.msg }}
@@ -446,6 +495,12 @@
                 const getKey = ref('')
                 const lastValue = ref('')
 
+                // Chat State
+                const chatHandle = ref('User_' + Math.floor(Math.random() * 1000))
+                const chatInput = ref('')
+                const chatMessages = ref([])
+                const seenChatKeys = new Set()
+
                 const addLog = (msg, type='info') => {
                     const time = new Date().toLocaleTimeString();
                     logs.value.unshift({ msg: `[${time}] ${msg}`, type });
@@ -459,6 +514,22 @@
                         
                         const kRes = await fetch('/api/keys');
                         keys.value = await kRes.json();
+
+                        // Sync Chat
+                        const chatKeys = keys.value.filter(k => k.startsWith('chat:msg:') && !seenChatKeys.has(k));
+                        for(const ck of chatKeys) {
+                            seenChatKeys.add(ck);
+                            const res = await fetch(`/api/get?k=${encodeURIComponent(ck)}`);
+                            const data = await res.json();
+                            if(data.value) {
+                                const [sender, ...textParts] = data.value.split(':');
+                                chatMessages.value.push({ sender, text: textParts.join(':') });
+                                setTimeout(() => {
+                                    const scroller = document.getElementById('chat-scroller');
+                                    if(scroller) scroller.scrollTop = scroller.scrollHeight;
+                                }, 100);
+                            }
+                        }
 
                         updateMesh();
                         
@@ -478,6 +549,18 @@
                     } catch (e) {
                         addLog(`Error: ${e.message}`, 'error');
                     }
+                }
+
+                const sendChat = async () => {
+                    if(!chatInput.value.trim()) return;
+                    const msgId = 'chat:msg:' + Math.random().toString(36).substr(2, 9);
+                    const payload = `${chatHandle.value}:${chatInput.value}`;
+                    const url = `/api/set?k=${encodeURIComponent(msgId)}&v=${encodeURIComponent(payload)}`;
+                    chatInput.value = '';
+                    try {
+                        await fetch(url);
+                        spawnPacketAnimation();
+                    } catch (e) {}
                 }
 
                 const queryData = async () => {
@@ -589,7 +672,8 @@
 
                 onMounted(poll);
 
-                return { stats, keys, logs, setKey, setValue, getKey, lastValue, injectData, queryData };
+                return { stats, keys, logs, setKey, setValue, getKey, lastValue, injectData, queryData,
+                         chatHandle, chatInput, chatMessages, sendChat };
             }
         }).mount('#app')
     </script>

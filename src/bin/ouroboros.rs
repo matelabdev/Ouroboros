@@ -1,93 +1,72 @@
-use std::env;
-use std::io::{self, BufRead, BufReader, Write};
-use std::net::TcpStream;
-use std::time::Instant;
+use std::io::{BufRead, BufReader, Write};
+use std::net::TcpListener;
+use std::collections::HashMap;
+use std::time::Duration;
 
-fn execute_command(stream: &mut TcpStream, cmd: &str) {
-    let start = Instant::now();
-    if let Err(e) = stream.write_all(format!("{}\n", cmd).as_bytes()) {
-        eprintln!("Error writing to socket: {}", e);
-        return;
+struct OuroStore {
+    data: HashMap<String, String>,
+}
+
+impl OuroStore {
+    fn new() -> Self {
+        Self { data: HashMap::new() }
     }
 
-    let mut reader = BufReader::new(stream.try_clone().unwrap());
-    let mut response = String::new();
-    if let Ok(n) = reader.read_line(&mut response) {
-        if n == 0 {
-            eprintln!("Connection closed by server.");
-            return;
-        }
-        let latency = start.elapsed().as_micros();
-        let response = response.trim_end();
-        if response.starts_with("+") {
-            if response == "+OK" {
-                println!("OK ({} µs)", latency);
-            } else {
-                println!("\"{}\"\n(Latency: {} µs)", &response[1..], latency);
+    fn handle_line(&mut self, line: &str) -> String {
+        let parts: Vec<&str> = line.trim().splitn(3, ' ').collect();
+        if parts.is_empty() { return "-ERR Empty".to_string(); }
+
+        match parts[0].to_uppercase().as_str() {
+            "SET" => {
+                if parts.len() < 3 { return "-ERR SET needs key and value".to_string(); }
+                self.data.insert(parts[1].to_string(), parts[2].to_string());
+                "+OK".to_string()
             }
-        } else if response.starts_with("-ERR") {
-            eprintln!("(error) {}", &response[5..]);
-        } else if response == "$-1" {
-            println!("(nil)");
-        } else if response.starts_with("*") {
-            let count: usize = response[1..].parse().unwrap_or(0);
-            if count == 0 {
-                println!("(empty)");
-            } else {
-                for i in 0..count {
-                    let mut len_str = String::new();
-                    reader.read_line(&mut len_str).unwrap();
-                    let mut val_str = String::new();
-                    reader.read_line(&mut val_str).unwrap();
-                    println!("{}) {}", i + 1, val_str.trim_end());
+            "GET" => {
+                if parts.len() < 2 { return "-ERR GET needs key".to_string(); }
+                if let Some(val) = self.data.get(parts[1]) {
+                    format!("+{}", val)
+                } else {
+                    "$-1".to_string()
                 }
-                println!("({} key{})", count, if count == 1 { "" } else { "s" });
             }
-        } else {
-            println!("{}", response);
+            "KEYS" => {
+                let pattern = if parts.len() > 1 { parts[1] } else { "*" };
+                let keys: Vec<&String> = self.data.keys()
+                    .filter(|k| k.contains(pattern.replace("*", "").as_str()))
+                    .collect();
+                
+                let mut resp = format!("*{}", keys.len());
+                for key in keys {
+                    resp.push_str(&format!("\n${}\n{}", key.len(), key));
+                }
+                resp
+            }
+            _ => "-ERR Unknown Command".to_string(),
         }
     }
 }
 
 fn main() {
-    let args: Vec<String> = env::args().collect();
-    
-    let mut stream = match TcpStream::connect("127.0.0.1:8825") {
-        Ok(s) => {
-            let _ = s.set_nodelay(true);
-            s
-        },
-        Err(_) => {
-            eprintln!("Could not connect to Ouroboros on 127.0.0.1:8825.");
-            eprintln!("Is the server running?");
-            std::process::exit(1);
-        }
-    };
+    let listener = TcpListener::bind("0.0.0.0:8825").expect("Could not bind Ouroboros Core");
+    let mut store = OuroStore::new();
+    println!("Ouroboros Core Engine (RAM-Only) started on port 8825");
 
-    if args.len() > 1 {
-        let cmd = args[1..].join(" ");
-        execute_command(&mut stream, &cmd);
-    } else {
-        println!("ouroboros-cli (connected to 127.0.0.1:8825 via Raw TCP)");
-        loop {
-            print!("> ");
-            io::stdout().flush().unwrap();
-            let mut input = String::new();
-            match io::stdin().read_line(&mut input) {
-                Ok(n) if n == 0 => break, // EOF
-                Ok(_) => {
-                    let cmd = input.trim();
-                    if cmd.is_empty() { continue; }
-                    if cmd.eq_ignore_ascii_case("exit") || cmd.eq_ignore_ascii_case("quit") {
-                        break;
-                    }
-                    execute_command(&mut stream, cmd);
-                }
-                Err(e) => {
-                    eprintln!("Error reading input: {}", e);
-                    break;
+    for stream in listener.incoming() {
+        match stream {
+            Ok(mut stream) => {
+                // CRITICAL: Set short timeouts to prevent hanging the whole ring
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+                let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+                
+                let mut reader = BufReader::new(&stream);
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_ok() && !line.is_empty() {
+                    let response = store.handle_line(&line);
+                    let _ = stream.write_all(format!("{}\n", response).as_bytes());
                 }
             }
+            Err(e) => eprintln!("Stream error: {}", e),
         }
     }
 }
