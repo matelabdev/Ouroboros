@@ -8,6 +8,8 @@ use std::fs;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::net::{TcpListener, TcpStream};
+use std::io::{Read, Write, BufReader, BufRead};
 use tiny_http::{Header, Response, Server};
 use urlencoding::decode;
 
@@ -409,6 +411,115 @@ fn inject_string_payload(web_tx: &mut Box<dyn datalink::DataLinkSender>, node1_m
     }
 }
 
+fn start_tcp_ipc(interface_name: String, node_id: u32, use_virtual_mac: bool, shared: Arc<SharedState>) {
+    let interfaces = datalink::interfaces();
+    let interface = interfaces.into_iter().find(|i| i.name == interface_name).expect("Interface not found");
+    let mut config = datalink::Config::default();
+    config.read_timeout = Some(Duration::from_millis(10));
+    let mut tx = match datalink::channel(&interface, config) {
+        Ok(Channel::Ethernet(tx, _)) => tx,
+        _ => panic!("Need Ethernet channel"),
+    };
+    let my_mac = if use_virtual_mac { get_mac(node_id) } else { interface.mac.expect("No MAC") };
+
+    let listener = TcpListener::bind("0.0.0.0:8825").expect("Could not bind to port 8825 for TCP IPC");
+    println!("Starting Raw TCP IPC on port 8825");
+
+    for stream in listener.incoming() {
+        match stream {
+            Ok(mut stream) => {
+                let shared = Arc::clone(&shared);
+                let mut tx_box = match datalink::channel(&interface, config) {
+                    Ok(Channel::Ethernet(tx, _)) => tx,
+                    _ => panic!("Need Ethernet channel"),
+                };
+                let my_mac = my_mac;
+                thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut line = String::new();
+                    while let Ok(n) = reader.read_line(&mut line) {
+                        if n == 0 { break; }
+                        let parts: Vec<&str> = line.trim().split_whitespace().collect();
+                        if parts.is_empty() { line.clear(); continue; }
+
+                        match parts[0].to_uppercase().as_str() {
+                            "GET" => {
+                                if parts.len() < 2 {
+                                    let _ = stream.write_all(b"-ERR missing key\n");
+                                } else {
+                                    let key = parts[1].to_string();
+                                    shared.http_responses.lock().unwrap().remove(&key);
+                                    let map = shared.global_live_nodes.lock().unwrap();
+                                    let query_next_mac = get_next_alive(node_id, &*map, false);
+                                    drop(map);
+
+                                    let p = Packet::Query { key: key.clone(), origin_mac: node_id as u8, ttl: DEFAULT_TTL };
+                                    send_l2_packet(&mut tx_box, my_mac, query_next_mac, &p);
+
+                                    let start = Instant::now();
+                                    let mut assembled_value = None;
+                                    while start.elapsed() < Duration::from_secs(2) {
+                                        let map = shared.http_responses.lock().unwrap();
+                                        if let Some((chunks_map, total_chunks)) = map.get(&key) {
+                                            if chunks_map.len() == *total_chunks as usize {
+                                                let mut full_data = Vec::new();
+                                                for i in 0..*total_chunks {
+                                                    if let Some(chunk) = chunks_map.get(&i) {
+                                                        full_data.extend_from_slice(chunk);
+                                                    }
+                                                }
+                                                if let Ok(s) = String::from_utf8(full_data) {
+                                                    assembled_value = Some(s);
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        drop(map);
+                                        thread::sleep(Duration::from_micros(50));
+                                    }
+
+                                    if let Some(v) = assembled_value {
+                                        let _ = stream.write_all(format!("+{}\n", v).as_bytes());
+                                    } else {
+                                        let _ = stream.write_all(b"$-1\n");
+                                    }
+                                }
+                            }
+                            "SET" => {
+                                if parts.len() < 3 {
+                                    let _ = stream.write_all(b"-ERR missing key or value\n");
+                                } else {
+                                    let key = parts[1].to_string();
+                                    let value = parts[2..].join(" ");
+                                    let map = shared.global_live_nodes.lock().unwrap();
+                                    let dest = get_next_alive(node_id, &*map, true);
+                                    drop(map);
+                                    inject_string_payload(&mut tx_box, my_mac, dest, key, value);
+                                    let _ = stream.write_all(b"+OK\n");
+                                }
+                            }
+                            "KEYS" => {
+                                let pattern = if parts.len() > 1 { parts[1] } else { "*" };
+                                let keys = shared.all_keys.lock().unwrap();
+                                let matching: Vec<&String> = keys.iter().filter(|k| matches_pattern(k, pattern)).collect();
+                                let _ = stream.write_all(format!("*{}\n", matching.len()).as_bytes());
+                                for k in matching {
+                                    let _ = stream.write_all(format!("${}\n{}\n", k.len(), k).as_bytes());
+                                }
+                            }
+                            _ => {
+                                let _ = stream.write_all(b"-ERR unknown command\n");
+                            }
+                        }
+                        line.clear();
+                    }
+                });
+            }
+            Err(e) => eprintln!("TCP Connection failed: {}", e),
+        }
+    }
+}
+
 fn main() {
     let mut interface_name = String::new();
     let mut node_id: u32 = 1;
@@ -467,6 +578,10 @@ fn main() {
         let s = Arc::clone(&shared);
         thread::spawn(move || spawn_node(iface, node_id, Some(s), false, use_virtual_mac));
 
+        let iface = interface_name.clone();
+        let s = Arc::clone(&shared);
+        thread::spawn(move || start_tcp_ipc(iface, node_id, use_virtual_mac, s));
+
         // Give the ring loop a moment to warm up
         thread::sleep(Duration::from_millis(1000));
 
@@ -481,14 +596,14 @@ fn main() {
         };
         let relay_mac = if use_virtual_mac { get_mac(node_id) } else { interface.mac.expect("No MAC") };
 
-        let server = (8825u16..8835)
+        let server = (3000u16..3010)
             .find_map(|port| {
                 match Server::http(format!("0.0.0.0:{}", port)) {
                     Ok(s) => { println!("Starting local HTTP gateway on http://0.0.0.0:{}", port); Some(s) }
                     Err(_) => None,
                 }
             })
-            .expect("Could not bind to any port in range 8825-8834");
+            .expect("Could not bind to any port in range 3000-3009");
         for request in server.incoming_requests() {
             let url = request.url().to_string();
             if url.starts_with("/api/get") {
@@ -583,6 +698,10 @@ fn main() {
     let v_mac = use_virtual_mac;
     thread::spawn(move || spawn_node(iface, 1, Some(s), snaps, v_mac));
 
+    let iface = interface_name.clone();
+    let s = Arc::clone(&shared);
+    thread::spawn(move || start_tcp_ipc(iface, 1, use_virtual_mac, s));
+
     let interfaces = datalink::interfaces();
     let interface = interfaces.into_iter().find(|i| i.name == interface_name).expect("Interface not found");
     let mut config = datalink::Config::default();
@@ -616,14 +735,14 @@ fn main() {
         }
     }
 
-    let server = (8825u16..8835)
+    let server = (3000u16..3010)
         .find_map(|port| {
             match Server::http(format!("0.0.0.0:{}", port)) {
                 Ok(s) => { println!("Starting Web Dashboard on http://0.0.0.0:{}", port); Some(s) }
                 Err(_) => None,
             }
         })
-        .expect("Could not bind to any port in range 8825-8834");
+        .expect("Could not bind to any port in range 3000-3009");
     let html = include_str!("index.html");
 
     for request in server.incoming_requests() {

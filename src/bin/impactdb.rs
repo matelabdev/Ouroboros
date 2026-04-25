@@ -1,103 +1,90 @@
 use std::env;
-use std::io::{self, Write};
+use std::io::{self, BufRead, BufReader, Write};
+use std::net::TcpStream;
 use std::time::Instant;
+
+fn execute_command(stream: &mut TcpStream, cmd: &str) {
+    let start = Instant::now();
+    if let Err(e) = stream.write_all(format!("{}\n", cmd).as_bytes()) {
+        eprintln!("Error writing to socket: {}", e);
+        return;
+    }
+
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut response = String::new();
+    if let Ok(n) = reader.read_line(&mut response) {
+        if n == 0 {
+            eprintln!("Connection closed by server.");
+            return;
+        }
+        let latency = start.elapsed().as_micros();
+        let response = response.trim_end();
+        if response.starts_with("+") {
+            if response == "+OK" {
+                println!("OK ({} µs)", latency);
+            } else {
+                println!("\"{}\"\n(Latency: {} µs)", &response[1..], latency);
+            }
+        } else if response.starts_with("-ERR") {
+            eprintln!("(error) {}", &response[5..]);
+        } else if response == "$-1" {
+            println!("(nil)");
+        } else if response.starts_with("*") {
+            let count: usize = response[1..].parse().unwrap_or(0);
+            if count == 0 {
+                println!("(empty)");
+            } else {
+                for i in 0..count {
+                    let mut len_str = String::new();
+                    reader.read_line(&mut len_str).unwrap();
+                    let mut val_str = String::new();
+                    reader.read_line(&mut val_str).unwrap();
+                    println!("{}) {}", i + 1, val_str.trim_end());
+                }
+                println!("({} key{})", count, if count == 1 { "" } else { "s" });
+            }
+        } else {
+            println!("{}", response);
+        }
+    }
+}
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-
-    if args.len() < 2 {
-        eprintln!("Usage:");
-        eprintln!("  impactdb get <key>");
-        eprintln!("  impactdb set <key> <value>");
-        eprintln!("  impactdb keys [pattern]   (e.g. 'user_*', default: *)");
-        eprintln!("");
-        eprintln!("Connects to the local impactDB node gateway at http://localhost:8825");
-        std::process::exit(1);
-    }
-
-    let command = &args[1];
-
-    match command.as_str() {
-        "get" => {
-            if args.len() < 3 { eprintln!("Error: key missing."); std::process::exit(1); }
-            let key = &args[2];
-            let start = Instant::now();
-            let url = format!(
-                "http://localhost:8825/api/get?k={}",
-                urlencoding::encode(key)
-            );
-
-            match ureq::get(&url).call() {
-                Ok(response) => {
-                    let body = response.into_string().unwrap_or_default();
-                    let json: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
-                    if let Some(value) = json.get("value").and_then(|v| v.as_str()) {
-                        println!("\"{}\"", value);
-                        println!("(Latency: {} µs)", start.elapsed().as_micros());
-                    } else {
-                        let err = json.get("error").and_then(|e| e.as_str()).unwrap_or("Not Found or Dropped");
-                        eprintln!("(nil) - {}", err);
-                        std::process::exit(1);
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Connection refused. Is the impactDB server running?");
-                    eprintln!("Details: {}", e);
-                    std::process::exit(1);
-                }
-            }
-        }
-        "set" => {
-            if args.len() < 4 { eprintln!("Error: Value is missing."); std::process::exit(1); }
-            let key = &args[2];
-            let value = &args[3];
-            let start = Instant::now();
-            let url = format!(
-                "http://localhost:8825/api/set?k={}&v={}",
-                urlencoding::encode(key),
-                urlencoding::encode(value)
-            );
-
-            match ureq::get(&url).call() {
-                Ok(_) => {
-                    println!("OK ({} µs)", start.elapsed().as_micros());
-                }
-                Err(e) => {
-                    eprintln!("Connection refused. Is the impactDB server running?");
-                    eprintln!("Details: {}", e);
-                    std::process::exit(1);
-                }
-            }
-        }
-        "keys" => {
-            let pattern = args.get(2).map(|s| s.as_str()).unwrap_or("*");
-            let url = format!("http://localhost:8825/api/keys?pattern={}", urlencoding::encode(pattern));
-
-            match ureq::get(&url).call() {
-                Ok(response) => {
-                    let body = response.into_string().unwrap_or_default();
-                    let json: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
-                    if let Some(keys) = json.get("keys").and_then(|k| k.as_array()) {
-                        if keys.is_empty() {
-                            println!("(empty)");
-                        } else {
-                            for (i, k) in keys.iter().enumerate() {
-                                println!("{}) {}", i + 1, k.as_str().unwrap_or(""));
-                            }
-                            println!("({} key{})", keys.len(), if keys.len() == 1 { "" } else { "s" });
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Connection refused. Is the impactDB server running?");
-                    eprintln!("Details: {}", e);
-                    std::process::exit(1);
-                }
-            }
-        }
-        _ => {
-            eprintln!("Unknown command '{}'. Use 'get', 'set', or 'keys'.", command);
+    
+    let mut stream = match TcpStream::connect("127.0.0.1:8825") {
+        Ok(s) => s,
+        Err(_) => {
+            eprintln!("Could not connect to impactDB on 127.0.0.1:8825.");
+            eprintln!("Is the server running?");
             std::process::exit(1);
+        }
+    };
+
+    if args.len() > 1 {
+        let cmd = args[1..].join(" ");
+        execute_command(&mut stream, &cmd);
+    } else {
+        println!("impactdb-cli (connected to 127.0.0.1:8825 via Raw TCP)");
+        loop {
+            print!("> ");
+            io::stdout().flush().unwrap();
+            let mut input = String::new();
+            match io::stdin().read_line(&mut input) {
+                Ok(n) if n == 0 => break, // EOF
+                Ok(_) => {
+                    let cmd = input.trim();
+                    if cmd.is_empty() { continue; }
+                    if cmd.eq_ignore_ascii_case("exit") || cmd.eq_ignore_ascii_case("quit") {
+                        break;
+                    }
+                    execute_command(&mut stream, cmd);
+                }
+                Err(e) => {
+                    eprintln!("Error reading input: {}", e);
+                    break;
+                }
+            }
         }
     }
 }
