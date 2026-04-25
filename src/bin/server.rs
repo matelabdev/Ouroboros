@@ -195,7 +195,7 @@ fn spawn_node(interface_name: String, node_id: u32, total_nodes: u32, shared: Op
             }
         }
 
-        // True Self-Healing: Data Rescue Operation
+        // True Self-Healing: Data Rescue Operation for DEAD Nodes
         for i in 1..=total_nodes {
             if i == node_id { continue; }
             let is_alive = if let Some(&(_, time)) = live_nodes.get(&(i as u8)) {
@@ -204,14 +204,27 @@ fn spawn_node(interface_name: String, node_id: u32, total_nodes: u32, shared: Op
             
             if !is_alive && !known_dead.contains_key(&(i as u8)) {
                 known_dead.insert(i as u8, true);
-                let data_next_mac = get_next_alive(node_id, total_nodes, &live_nodes, true);
                 for ((k, chunk_idx), (data, total_chunks, epoch, _)) in recent_data.iter() {
                     let rescue_packet = Packet::Data { key: k.clone(), chunk_index: *chunk_idx, total_chunks: *total_chunks, data: data.clone(), epoch: *epoch };
-                    send_l2_packet(&mut tx, my_mac, data_next_mac, &rescue_packet);
+                    send_l2_packet(&mut tx, my_mac, MacAddr::broadcast(), &rescue_packet);
                 }
             } else if is_alive {
                 known_dead.remove(&(i as u8));
             }
+        }
+
+        // Biological Self-Healing: Packet Cloning for In-Flight Drops
+        let mut to_regenerate = Vec::new();
+        for ((k, chunk_idx), (data, total_chunks, epoch, time)) in recent_data.iter() {
+            if now.duration_since(*time) > Duration::from_millis(200) && now.duration_since(*time) < HISTORY_DURATION {
+                to_regenerate.push((k.clone(), *chunk_idx, data.clone(), *total_chunks, *epoch));
+            }
+        }
+        for (k, chunk_idx, data, total_chunks, epoch) in to_regenerate {
+            // Update time to prevent immediate re-cloning
+            recent_data.insert((k.clone(), chunk_idx), (data.clone(), total_chunks, epoch, Instant::now()));
+            let rescue_packet = Packet::Data { key: k, chunk_index: chunk_idx, total_chunks, data, epoch };
+            send_l2_packet(&mut tx, my_mac, MacAddr::broadcast(), &rescue_packet);
         }
 
         if let Ok(frame) = rx.next() {
