@@ -8,8 +8,8 @@ use std::fs;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use std::net::{TcpListener, TcpStream};
-use std::io::{Read, Write, BufReader, BufRead};
+use std::net::TcpListener;
+use std::io::{Write, BufReader, BufRead};
 use tiny_http::{Header, Response, Server};
 use urlencoding::decode;
 
@@ -416,10 +416,6 @@ fn start_tcp_ipc(interface_name: String, node_id: u32, use_virtual_mac: bool, sh
     let interface = interfaces.into_iter().find(|i| i.name == interface_name).expect("Interface not found");
     let mut config = datalink::Config::default();
     config.read_timeout = Some(Duration::from_millis(10));
-    let mut tx = match datalink::channel(&interface, config) {
-        Ok(Channel::Ethernet(tx, _)) => tx,
-        _ => panic!("Need Ethernet channel"),
-    };
     let my_mac = if use_virtual_mac { get_mac(node_id) } else { interface.mac.expect("No MAC") };
 
     let listener = TcpListener::bind("0.0.0.0:8825").expect("Could not bind to port 8825 for TCP IPC");
