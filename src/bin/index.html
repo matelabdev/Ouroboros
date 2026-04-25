@@ -3,400 +3,593 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Ouroboros | Data in Flight</title>
+    <title>Ouroboros | L2 Mesh Visualizer</title>
     <style>
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800&family=JetBrains+Mono:wght@400;700&display=swap');
+        @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&family=JetBrains+Mono:wght@400;700&display=swap');
         
         :root {
-            --bg: #09090b;
-            --glass: rgba(255, 255, 255, 0.03);
-            --glass-border: rgba(255, 255, 255, 0.08);
-            --accent: #3b82f6;
-            --accent-glow: rgba(59, 130, 246, 0.5);
-            --text-main: #f8fafc;
-            --text-muted: #94a3b8;
-            --danger: #ef4444;
+            --bg: #050505;
+            --panel-bg: rgba(15, 15, 20, 0.8);
+            --border: rgba(255, 255, 255, 0.1);
+            --accent: #00f2ff;
+            --accent-glow: rgba(0, 242, 255, 0.4);
+            --text: #e2e8f0;
+            --muted: #64748b;
             --success: #10b981;
+            --danger: #ff0055;
+            --warning: #f59e0b;
         }
 
         body {
             background-color: var(--bg);
-            color: var(--text-main);
-            font-family: 'Inter', sans-serif;
+            color: var(--text);
+            font-family: 'Outfit', sans-serif;
             margin: 0;
-            padding: 0;
+            overflow: hidden;
+            height: 100vh;
             display: flex;
-            justify-content: center;
+            flex-direction: column;
+        }
+
+        .background-glow {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            width: 800px;
+            height: 800px;
+            background: radial-gradient(circle, rgba(0, 242, 255, 0.05) 0%, transparent 70%);
+            pointer-events: none;
+            z-index: -1;
+        }
+
+        header {
+            padding: 1.5rem 2rem;
+            display: flex;
+            justify-content: space-between;
             align-items: center;
-            min-height: 100vh;
-            background-image: 
-                radial-gradient(circle at 15% 50%, rgba(59, 130, 246, 0.15), transparent 25%),
-                radial-gradient(circle at 85% 30%, rgba(139, 92, 246, 0.15), transparent 25%);
+            border-bottom: 1px solid var(--border);
+            backdrop-filter: blur(10px);
+            z-index: 10;
         }
 
-        .dashboard {
-            width: 100%;
-            max-width: 900px;
-            padding: 2rem;
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 2rem;
+        .logo {
+            display: flex;
+            align-items: center;
+            gap: 12px;
         }
 
-        .header {
-            grid-column: 1 / -1;
-            text-align: center;
-            margin-bottom: 1rem;
-        }
-
-        .header h1 {
-            font-size: 3rem;
-            font-weight: 800;
-            letter-spacing: -0.05em;
+        .logo h1 {
             margin: 0;
-            background: linear-gradient(135deg, #fff 0%, #94a3b8 100%);
+            font-size: 1.5rem;
+            font-weight: 800;
+            letter-spacing: 2px;
+            text-transform: uppercase;
+            background: linear-gradient(to right, #fff, var(--accent));
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
         }
 
-        .header p {
-            color: var(--text-muted);
-            font-size: 1.1rem;
-            margin-top: 0.5rem;
-        }
-
-        .panel {
-            background: var(--glass);
-            border: 1px solid var(--glass-border);
-            border-radius: 24px;
-            padding: 2rem;
-            backdrop-filter: blur(20px);
-            -webkit-backdrop-filter: blur(20px);
-            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
-            transition: transform 0.3s ease, border-color 0.3s ease;
-        }
-
-        .panel:hover {
-            border-color: rgba(255,255,255,0.15);
-            transform: translateY(-2px);
-        }
-
-        h2 {
-            font-size: 1.25rem;
-            font-weight: 600;
-            margin-top: 0;
-            margin-bottom: 1.5rem;
+        .status-badge {
             display: flex;
             align-items: center;
-            gap: 0.5rem;
+            gap: 8px;
+            font-size: 0.8rem;
+            font-weight: 600;
+            padding: 6px 12px;
+            background: rgba(16, 185, 129, 0.1);
+            color: var(--success);
+            border: 1px solid rgba(16, 185, 129, 0.2);
+            border-radius: 100px;
         }
 
-        .stat-box {
-            text-align: center;
-            padding: 2rem 0;
+        .encryption-badge {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.8rem;
+            font-weight: 600;
+            padding: 6px 12px;
+            background: rgba(0, 242, 255, 0.1);
+            color: var(--accent);
+            border: 1px solid rgba(0, 242, 255, 0.2);
+            border-radius: 100px;
         }
 
-        .stat-value {
-            font-family: 'JetBrains Mono', monospace;
-            font-size: 4rem;
-            font-weight: 700;
-            line-height: 1;
-            text-shadow: 0 0 30px var(--accent-glow);
-            transition: color 0.3s ease;
+        main {
+            flex: 1;
+            display: grid;
+            grid-template-columns: 350px 1fr 350px;
+            gap: 0;
+            position: relative;
         }
 
-        .stat-label {
-            color: var(--text-muted);
-            font-size: 0.9rem;
-            text-transform: uppercase;
-            letter-spacing: 0.1em;
-            margin-top: 1rem;
+        .side-panel {
+            background: var(--panel-bg);
+            border-right: 1px solid var(--border);
+            padding: 2rem;
+            display: flex;
+            flex-direction: column;
+            gap: 2rem;
+            z-index: 5;
         }
 
-        .form-group {
-            margin-bottom: 1.5rem;
+        .side-panel.right {
+            border-right: none;
+            border-left: 1px solid var(--border);
         }
 
-        label {
-            display: block;
+        .visualizer {
+            position: relative;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            overflow: hidden;
+        }
+
+        .card {
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 1.5rem;
+        }
+
+        .card h3 {
+            margin: 0 0 1rem 0;
             font-size: 0.85rem;
-            color: var(--text-muted);
-            margin-bottom: 0.5rem;
             text-transform: uppercase;
-            letter-spacing: 0.05em;
+            color: var(--muted);
+            letter-spacing: 1px;
+        }
+
+        .metric {
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+            margin-bottom: 0.5rem;
+        }
+
+        .metric-value {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 1.5rem;
+            font-weight: 700;
+            color: var(--accent);
+        }
+
+        .metric-label {
+            font-size: 0.8rem;
+            color: var(--muted);
+        }
+
+        .control-group {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
         }
 
         input {
-            width: 100%;
-            background: rgba(0,0,0,0.2);
-            border: 1px solid var(--glass-border);
-            border-radius: 12px;
-            padding: 1rem;
-            color: #fff;
+            background: rgba(0, 0, 0, 0.4);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 12px;
+            color: white;
             font-family: 'JetBrains Mono', monospace;
-            font-size: 1rem;
+            font-size: 0.9rem;
+            width: 100%;
             box-sizing: border-box;
-            transition: all 0.2s ease;
         }
 
         input:focus {
             outline: none;
             border-color: var(--accent);
-            box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.2);
         }
 
         button {
-            width: 100%;
             background: var(--accent);
-            color: #fff;
+            color: black;
             border: none;
-            border-radius: 12px;
-            padding: 1rem;
-            font-size: 1rem;
-            font-weight: 600;
+            border-radius: 8px;
+            padding: 12px;
+            font-weight: 700;
             cursor: pointer;
             transition: all 0.2s ease;
-            box-shadow: 0 4px 14px 0 rgba(59, 130, 246, 0.39);
+            text-transform: uppercase;
+            letter-spacing: 1px;
         }
 
         button:hover {
-            background: #2563eb;
-            transform: translateY(-1px);
-            box-shadow: 0 6px 20px rgba(59, 130, 246, 0.23);
+            transform: scale(1.02);
+            filter: brightness(1.2);
+            box-shadow: 0 0 20px var(--accent-glow);
         }
 
-        button:active {
-            transform: translateY(1px);
+        .ring-container {
+            width: 600px;
+            height: 600px;
+            position: relative;
         }
 
-        button.get-btn {
-            background: #10b981;
-            box-shadow: 0 4px 14px 0 rgba(16, 185, 129, 0.39);
+        #mesh-svg {
+            width: 100%;
+            height: 100%;
         }
 
-        button.get-btn:hover {
-            background: #059669;
-            box-shadow: 0 6px 20px rgba(16, 185, 129, 0.23);
+        .node-circle {
+            fill: #111;
+            stroke: var(--accent);
+            stroke-width: 2;
+            transition: all 0.5s ease;
+        }
+
+        .node-circle.self {
+            stroke-width: 4;
+            filter: drop-shadow(0 0 8px var(--accent-glow));
+        }
+
+        .node-text {
+            fill: white;
+            font-size: 12px;
+            font-weight: bold;
+            text-anchor: middle;
+            pointer-events: none;
+        }
+
+        .connection-line {
+            stroke: var(--border);
+            stroke-width: 1;
+            stroke-dasharray: 5,5;
+            animation: dash 20s linear infinite;
+        }
+
+        @keyframes dash {
+            from { stroke-dashoffset: 1000; }
+            to { stroke-dashoffset: 0; }
+        }
+
+        .photon {
+            fill: var(--accent);
+            filter: blur(2px);
         }
 
         .console {
-            grid-column: 1 / -1;
-            background: rgba(0,0,0,0.4);
-            border-radius: 16px;
-            padding: 1.5rem;
+            background: rgba(0, 0, 0, 0.5);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 1rem;
             font-family: 'JetBrains Mono', monospace;
-            font-size: 0.9rem;
-            height: 150px;
+            font-size: 0.75rem;
+            height: 200px;
             overflow-y: auto;
-            border: 1px solid var(--glass-border);
+            color: #888;
         }
 
-        .console-line {
-            margin-bottom: 0.5rem;
-            opacity: 0;
-            animation: fadein 0.3s forwards;
+        .console-entry {
+            margin-bottom: 4px;
+            border-left: 2px solid transparent;
+            padding-left: 8px;
         }
 
-        .console-line.success { color: var(--success); }
-        .console-line.error { color: var(--danger); }
-        .console-line.info { color: var(--accent); }
+        .console-entry.success { color: var(--success); border-color: var(--success); }
+        .console-entry.error { color: var(--danger); border-color: var(--danger); }
+        .console-entry.info { color: var(--accent); border-color: var(--accent); }
 
-        @keyframes fadein {
-            from { opacity: 0; transform: translateY(5px); }
-            to { opacity: 1; transform: translateY(0); }
-        }
-
-        .warning-glow {
-            color: var(--danger);
-            text-shadow: 0 0 30px rgba(239, 68, 68, 0.5);
+        .key-list {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            max-height: 300px;
+            overflow-y: auto;
         }
 
-        .kill-btn {
-            background: #000;
-            border: 1px solid var(--danger);
-            color: var(--danger);
-            margin-top: 1rem;
-            box-shadow: 0 0 15px rgba(239, 68, 68, 0.2);
+        .key-item {
+            padding: 8px 12px;
+            background: rgba(255,255,255,0.03);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.8rem;
+            display: flex;
+            justify-content: space-between;
         }
-        
-        .kill-btn:hover {
-            background: rgba(239, 68, 68, 0.1);
-            box-shadow: 0 0 20px rgba(239, 68, 68, 0.4);
+
+        .key-item:hover {
+            border-color: var(--accent);
+            background: rgba(0, 242, 255, 0.05);
         }
-        
-        .capacity-bar {
-            width: 100%;
-            height: 4px;
-            background: rgba(255,255,255,0.1);
-            border-radius: 2px;
-            margin-top: 2rem;
-            overflow: hidden;
-        }
-        
-        .capacity-fill {
-            height: 100%;
-            background: var(--accent);
-            width: 0%;
-            transition: width 0.3s ease, background-color 0.3s ease;
-        }
-        
-        .pulse {
-            display: inline-block;
+
+        .pulse-dot {
             width: 8px;
             height: 8px;
-            border-radius: 50%;
             background: var(--success);
-            box-shadow: 0 0 10px var(--success);
-            animation: pulse-anim 2s infinite;
+            border-radius: 50%;
+            display: inline-block;
         }
 
-        @keyframes pulse-anim {
-            0% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7); }
-            70% { box-shadow: 0 0 0 10px rgba(16, 185, 129, 0); }
-            100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
+        .overlay {
+            position: absolute;
+            bottom: 2rem;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            gap: 2rem;
         }
-
     </style>
 </head>
 <body>
-    <div id="app" class="dashboard">
-        <div class="header">
+    <div class="background-glow"></div>
+    
+    <header>
+        <div class="logo">
+            <svg width="32" height="32" viewBox="0 0 32 32">
+                <circle cx="16" cy="16" r="14" fill="none" stroke="url(#logo-grad)" stroke-width="4" stroke-dasharray="60,30" />
+                <defs>
+                    <linearGradient id="logo-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+                        <stop offset="0%" style="stop-color:#fff" />
+                        <stop offset="100%" style="stop-color:#00f2ff" />
+                    </linearGradient>
+                </defs>
+            </svg>
             <h1>Ouroboros</h1>
-            <p><span class="pulse"></span> L2 Raw Socket Ring Operational</p>
         </div>
-
-        <div class="panel">
-            <h2>Network Capacity</h2>
-            <div class="stat-box">
-                <div class="stat-value" :class="{'warning-glow': stats.capacity_limit_warning}">{{ stats.active_packets }}</div>
-                <div class="stat-label">Packets In Flight</div>
+        <div style="display: flex; gap: 1rem;">
+            <div class="encryption-badge" id="enc-badge">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>
+                <span>CHA-20 SECURE</span>
             </div>
-            <div class="capacity-bar">
-                <div class="capacity-fill" :style="{ width: capacityPercentage + '%', backgroundColor: stats.capacity_limit_warning ? '#ef4444' : '#3b82f6' }"></div>
-            </div>
-            <div style="text-align: center; margin-top: 10px; font-size: 0.8rem; color: #94a3b8;">
-                Estimated Hardware Limit: ~1000 Packets
-            </div>
-            <div v-if="stats.dead_nodes && stats.dead_nodes.length > 0" style="margin-top: 15px; color: #ef4444; text-align: center; font-weight: 600; font-size: 0.85rem; border: 1px solid rgba(239,68,68,0.3); padding: 5px; border-radius: 8px;">
-                ⚠️ ALERT: Nodes {{ stats.dead_nodes.join(', ') }} are OFFLINE. Routing automatically adjusted.
+            <div class="status-badge">
+                <span class="pulse-dot"></span>
+                <span>L2 RING ACTIVE</span>
             </div>
         </div>
+    </header>
 
-        <div class="panel">
-            <h2>Data Injection</h2>
-            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
-                <div class="form-group">
-                    <label>Key</label>
-                    <input type="text" v-model="setKey" placeholder="e.g. user_1">
+    <main id="app">
+        <div class="side-panel">
+            <div class="card">
+                <h3>Node Intelligence</h3>
+                <div class="metric">
+                    <span class="metric-label">Local Node ID</span>
+                    <span class="metric-value">#{{ stats.node_id }}</span>
                 </div>
-                <div class="form-group">
-                    <label>Value</label>
-                    <input type="text" v-model="setValue" placeholder="Hello, Ouroboros!">
+                <div class="metric">
+                    <span class="metric-label">Cluster Members</span>
+                    <span class="metric-value">{{ stats.peers ? stats.peers.length : 0 }}</span>
+                </div>
+                <div class="metric">
+                    <span class="metric-label">Active Key-Space</span>
+                    <span class="metric-value">{{ stats.active_keys_count }}</span>
                 </div>
             </div>
-            <button @click="injectData">INJECT INTO RING</button>
 
-            <div style="margin-top: 2rem;">
-                <div style="display: grid; grid-template-columns: 1fr auto; gap: 1rem;">
-                    <div class="form-group" style="margin: 0;">
-                        <input type="text" v-model="getKey" placeholder="Query Key (e.g. user_1)">
-                    </div>
-                    <button class="get-btn" @click="queryData">INTERCEPT</button>
+            <div class="card">
+                <h3>Data Injection</h3>
+                <div class="control-group">
+                    <input type="text" v-model="setKey" placeholder="KEY NAME">
+                    <input type="text" v-model="setValue" placeholder="VALUE PAYLOAD">
+                    <button @click="injectData">Inject Into Ring</button>
                 </div>
+            </div>
+
+            <div class="console" id="console">
+                <div v-for="log in logs" class="console-entry" :class="log.type">
+                    {{ log.msg }}
+                </div>
+            </div>
+        </div>
+
+        <div class="visualizer">
+            <div class="ring-container">
+                <svg id="mesh-svg" viewBox="0 0 400 400">
+                    <defs>
+                        <filter id="glow">
+                            <feGaussianBlur stdDeviation="2.5" result="coloredBlur"/>
+                            <feMerge>
+                                <feMergeNode in="coloredBlur"/>
+                                <feMergeNode in="SourceGraphic"/>
+                            </feMerge>
+                        </filter>
+                    </defs>
+                    <!-- Lines will be drawn here -->
+                    <g id="lines"></g>
+                    <!-- Nodes will be drawn here -->
+                    <g id="nodes"></g>
+                    <!-- Packets will be drawn here -->
+                    <g id="packets"></g>
+                </svg>
             </div>
             
-            <button class="kill-btn" @click="killNode(2)">SIMULATE NODE 2 CRASH 💀</button>
-        </div>
-
-        <div class="console" id="console">
-            <div v-for="(log, i) in logs" :key="i" class="console-line" :class="log.type">
-                > {{ log.msg }}
+            <div class="overlay">
+                <div class="encryption-badge" style="background: rgba(255,255,255,0.05); color: #fff;">
+                    MTU: 1500 BYTES
+                </div>
+                <div class="encryption-badge" style="background: rgba(255,255,255,0.05); color: #fff;">
+                    PROTO: 0x88B5
+                </div>
             </div>
         </div>
-    </div>
+
+        <div class="side-panel right">
+            <div class="card">
+                <h3>Global Key Registry</h3>
+                <div class="key-list">
+                    <div v-for="k in keys" class="key-item" @click="getKey = k; queryData()">
+                        <span>{{ k }}</span>
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <h3>Direct Interception</h3>
+                <div class="control-group">
+                    <input type="text" v-model="getKey" placeholder="TARGET KEY">
+                    <button @click="queryData" style="background: var(--success);">Intercept</button>
+                </div>
+                <div v-if="lastValue" style="margin-top: 1rem; padding: 1rem; background: rgba(0,0,0,0.4); border-radius: 8px; border: 1px solid var(--border); font-family: 'JetBrains Mono', monospace; font-size: 0.8rem; word-break: break-all;">
+                    <div style="color: var(--muted); margin-bottom: 4px;">INTERCEPTED VALUE:</div>
+                    {{ lastValue }}
+                </div>
+            </div>
+        </div>
+    </main>
 
     <script type="module">
-        import { createApp, ref, computed, onMounted } from 'https://unpkg.com/vue@3/dist/vue.esm-browser.js'
+        import { createApp, ref, onMounted, watch } from 'https://unpkg.com/vue@3/dist/vue.esm-browser.js'
 
         createApp({
             setup() {
-                const stats = ref({ active_packets: 0, capacity_limit_warning: false })
+                const stats = ref({ node_id: 1, peers: [], active_keys_count: 0, encryption: false })
+                const keys = ref([])
+                const logs = ref([])
                 const setKey = ref('')
                 const setValue = ref('')
                 const getKey = ref('')
-                const logs = ref([])
-
-                const capacityPercentage = computed(() => {
-                    let p = (stats.value.active_packets / 1000) * 100;
-                    return p > 100 ? 100 : p;
-                })
+                const lastValue = ref('')
 
                 const addLog = (msg, type='info') => {
-                    logs.value.push({msg, type})
-                    if(logs.value.length > 20) logs.value.shift()
-                    setTimeout(() => {
-                        const c = document.getElementById('console')
-                        if(c) c.scrollTop = c.scrollHeight
-                    }, 50)
+                    const time = new Date().toLocaleTimeString();
+                    logs.value.unshift({ msg: `[${time}] ${msg}`, type });
+                    if(logs.value.length > 50) logs.value.pop();
                 }
 
-                const pollStats = async () => {
+                const poll = async () => {
                     try {
-                        const res = await fetch('/api/stats')
-                        const data = await res.json()
-                        stats.value = data
-                    } catch (e) {
-                        // ignore
-                    }
-                    setTimeout(pollStats, 500)
+                        const sRes = await fetch('/api/stats');
+                        stats.value = await sRes.json();
+                        
+                        const kRes = await fetch('/api/keys');
+                        keys.value = await kRes.json();
+
+                        updateMesh();
+                        
+                        document.getElementById('enc-badge').style.display = stats.value.encryption ? 'flex' : 'none';
+                    } catch (e) {}
+                    setTimeout(poll, 1000);
                 }
 
                 const injectData = async () => {
                     if(!setKey.value || !setValue.value) return;
-                    addLog(`Injecting Key: ${setKey.value}, Value: ${setValue.value} to L2 Ring...`, 'info')
+                    addLog(`Injecting ${setKey.value}...`, 'info');
                     try {
-                        const res = await fetch(`/api/set?k=${encodeURIComponent(setKey.value)}&v=${encodeURIComponent(setValue.value)}`)
-                        const data = await res.json()
-                        addLog(`Successfully injected into the lightstream. (Latency: ${data.latency_us} µs)`, 'success')
+                        const res = await fetch(`/api/set?k=${encodeURIComponent(setKey.value)}&v=${encodeURIComponent(setValue.value)}`);
+                        const data = await res.json();
+                        addLog(`Success! Latency: ${data.latency_us}µs`, 'success');
+                        spawnPacketAnimation();
                     } catch (e) {
-                        addLog(`Failed to inject: ${e.message}`, 'error')
+                        addLog(`Error: ${e.message}`, 'error');
                     }
                 }
 
                 const queryData = async () => {
                     if(!getKey.value) return;
-                    addLog(`Firing Query interceptor for Key: ${getKey.value}...`, 'info')
+                    addLog(`Intercepting ${getKey.value}...`, 'info');
                     try {
-                        const res = await fetch(`/api/get?k=${encodeURIComponent(getKey.value)}`)
-                        const data = await res.json()
+                        const res = await fetch(`/api/get?k=${encodeURIComponent(getKey.value)}`);
+                        const data = await res.json();
                         if(data.error) {
-                            addLog(`Query Missed: ${data.error}`, 'error')
+                            addLog(`Miss: ${data.error}`, 'error');
+                            lastValue.value = '';
                         } else {
-                            addLog(`Collision Successful! Value intercepted:\n${data.value}\n(Latency: ${data.latency_us} µs)`, 'success')
+                            addLog(`Caught! Latency: ${data.latency_us}µs`, 'success');
+                            lastValue.value = data.value;
+                            spawnPacketAnimation(true);
                         }
                     } catch (e) {
-                        addLog(`Query failed: ${e.message}`, 'error')
+                        addLog(`Error: ${e.message}`, 'error');
                     }
                 }
 
-                const killNode = async (id) => {
-                    addLog(`Sending Assassination Signal to Node ${id}...`, 'error')
-                    try {
-                        const res = await fetch(`/api/kill?node=${id}`)
-                        const data = await res.json()
-                        addLog(data.status + ' -> Watch the ring self-heal!', 'error')
-                    } catch (e) { }
+                const updateMesh = () => {
+                    const nodesGroup = document.getElementById('nodes');
+                    const linesGroup = document.getElementById('lines');
+                    if (!nodesGroup || !linesGroup) return;
+
+                    const peers = stats.value.peers || [];
+                    const count = peers.length;
+                    const radius = 120;
+                    const center = 200;
+
+                    nodesGroup.innerHTML = '';
+                    linesGroup.innerHTML = '';
+
+                    const sortedPeers = [...peers].sort((a,b) => a.id - b.id);
+                    const positions = sortedPeers.map((p, i) => {
+                        const angle = (i / count) * 2 * Math.PI - Math.PI / 2;
+                        return {
+                            id: p.id,
+                            x: center + radius * Math.cos(angle),
+                            y: center + radius * Math.sin(angle)
+                        };
+                    });
+
+                    // Draw lines
+                    positions.forEach((pos, i) => {
+                        const next = positions[(i + 1) % count];
+                        const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+                        line.setAttribute("x1", pos.x);
+                        line.setAttribute("y1", pos.y);
+                        line.setAttribute("x2", next.x);
+                        line.setAttribute("y2", next.y);
+                        line.setAttribute("class", "connection-line");
+                        linesGroup.appendChild(line);
+                    });
+
+                    // Draw nodes
+                    positions.forEach(pos => {
+                        const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+                        circle.setAttribute("cx", pos.x);
+                        circle.setAttribute("cy", pos.y);
+                        circle.setAttribute("r", pos.id == stats.value.node_id ? "12" : "8");
+                        circle.setAttribute("class", "node-circle" + (pos.id == stats.value.node_id ? " self" : ""));
+                        
+                        const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
+                        text.setAttribute("x", pos.x);
+                        text.setAttribute("y", pos.y + 25);
+                        text.setAttribute("class", "node-text");
+                        text.textContent = `NODE ${pos.id}`;
+
+                        nodesGroup.appendChild(circle);
+                        nodesGroup.appendChild(text);
+                    });
                 }
 
-                onMounted(() => {
-                    addLog('Connection to Kernel Bypass Interface established.', 'success')
-                    pollStats()
-                })
+                const spawnPacketAnimation = (reverse = false) => {
+                    const packetsGroup = document.getElementById('packets');
+                    const lines = document.querySelectorAll('.connection-line');
+                    if (!packetsGroup || lines.length === 0) return;
 
-                return {
-                    stats, setKey, setValue, getKey, logs,
-                    capacityPercentage, injectData, queryData, killNode
+                    lines.forEach((line, i) => {
+                        setTimeout(() => {
+                            const photon = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+                            photon.setAttribute("r", "3");
+                            photon.setAttribute("class", "photon");
+                            photon.setAttribute("filter", "url(#glow)");
+                            packetsGroup.appendChild(photon);
+
+                            const x1 = parseFloat(line.getAttribute('x1'));
+                            const y1 = parseFloat(line.getAttribute('y1'));
+                            const x2 = parseFloat(line.getAttribute('x2'));
+                            const y2 = parseFloat(line.getAttribute('y2'));
+
+                            const animate = (t) => {
+                                const progress = t / 500; // 500ms per segment
+                                if (progress < 1) {
+                                    const p = reverse ? (1 - progress) : progress;
+                                    photon.setAttribute("cx", x1 + (x2 - x1) * p);
+                                    photon.setAttribute("cy", y1 + (y2 - y1) * p);
+                                    requestAnimationFrame(animate);
+                                } else {
+                                    photon.remove();
+                                }
+                            };
+                            requestAnimationFrame(animate);
+                        }, i * 100);
+                    });
                 }
+
+                onMounted(poll);
+
+                return { stats, keys, logs, setKey, setValue, getKey, lastValue, injectData, queryData };
             }
         }).mount('#app')
     </script>

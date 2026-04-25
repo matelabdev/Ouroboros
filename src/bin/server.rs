@@ -894,6 +894,36 @@ fn main() {
                 let latency = start.elapsed().as_micros();
                 request.respond(Response::from_string(format!("{{\"status\":\"ok\",\"latency_us\":{}}}", latency))).unwrap();
             }
+        } else if url == "/api/stats" {
+            let map = shared.global_live_nodes.lock().unwrap();
+            let mut peers = Vec::new();
+            let now = Instant::now();
+            
+            // Add self
+            peers.push(serde_json::json!({
+                "id": node_id,
+                "mac": "LOCAL",
+                "last_seen_ms": 0
+            }));
+
+            for (&id, &(mac, time)) in map.iter() {
+                peers.push(serde_json::json!({
+                    "id": id,
+                    "mac": mac.to_string(),
+                    "last_seen_ms": now.duration_since(time).as_millis()
+                }));
+            }
+            
+            let stats = serde_json::json!({
+                "node_id": node_id,
+                "encryption": shared.encryption_key.is_some(),
+                "peers": peers,
+                "active_keys_count": shared.all_keys.lock().unwrap().len()
+            });
+            
+            let mut response = Response::from_string(stats.to_string());
+            response.add_header(Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap());
+            request.respond(response).unwrap();
         } else if url.starts_with("/api/del") {
             if let Some((_, query)) = url.split_once('?') {
                 if let Some(kv) = query.split('=').collect::<Vec<&str>>().get(1) {
