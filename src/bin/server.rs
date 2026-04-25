@@ -162,6 +162,28 @@ struct SharedState {
     http_responses: Mutex<HashMap<String, (HashMap<u16, Vec<u8>>, u16)>>,
     active_data_count: Mutex<usize>,
     global_live_nodes: Mutex<HashMap<u8, (MacAddr, Instant)>>,
+    all_keys: Mutex<Vec<String>>,
+}
+
+fn matches_pattern(key: &str, pattern: &str) -> bool {
+    if pattern == "*" || pattern.is_empty() { return true; }
+    if !pattern.contains('*') { return key == pattern; }
+    let parts: Vec<&str> = pattern.split('*').collect();
+    let mut remaining = key;
+    for (i, part) in parts.iter().enumerate() {
+        if part.is_empty() { continue; }
+        if i == 0 {
+            if !remaining.starts_with(part) { return false; }
+            remaining = &remaining[part.len()..];
+        } else if i == parts.len() - 1 {
+            return remaining.ends_with(part);
+        } else if let Some(pos) = remaining.find(part) {
+            remaining = &remaining[pos + part.len()..];
+        } else {
+            return false;
+        }
+    }
+    true
 }
 
 #[derive(Serialize)]
@@ -328,6 +350,9 @@ fn spawn_node(interface_name: String, node_id: u32, shared: Option<Arc<SharedSta
             
             if let Some(ref s) = shared {
                 *s.active_data_count.lock().unwrap() = recent_data.len();
+                // Sync unique key names for /api/keys wildcard scan
+                let unique: std::collections::HashSet<String> = recent_data.keys().map(|(k, _)| k.clone()).collect();
+                *s.all_keys.lock().unwrap() = unique.into_iter().collect();
             }
             last_cleanup = now;
         }
@@ -435,6 +460,7 @@ fn main() {
             http_responses: Mutex::new(HashMap::new()),
             active_data_count: Mutex::new(0),
             global_live_nodes: Mutex::new(HashMap::new()),
+            all_keys: Mutex::new(Vec::new()),
         });
 
         let iface = interface_name.clone();
@@ -526,8 +552,18 @@ fn main() {
                     let latency = start.elapsed().as_micros();
                     request.respond(Response::from_string(format!("{{\"status\":\"ok\",\"latency_us\":{}}}", latency))).unwrap();
                 }
+            } else if url.starts_with("/api/keys") {
+                let pattern = if let Some((_, query)) = url.split_once('?') {
+                    query.split('=').nth(1)
+                        .map(|p| decode(p).unwrap_or_default().to_string())
+                        .unwrap_or_else(|| "*".to_string())
+                } else { "*".to_string() };
+                let keys = shared.all_keys.lock().unwrap();
+                let matching: Vec<&String> = keys.iter().filter(|k| matches_pattern(k, &pattern)).collect();
+                let json = serde_json::json!({"keys": matching, "count": matching.len()});
+                request.respond(Response::from_string(json.to_string())).unwrap();
             } else {
-                request.respond(Response::from_string("{\"error\":\"relay node: only /api/get and /api/set are supported\"}")).unwrap();
+                request.respond(Response::from_string("{\"error\":\"relay node: only /api/get, /api/set and /api/keys are supported\"}")).unwrap();
             }
         }
         return;
@@ -538,6 +574,7 @@ fn main() {
         http_responses: Mutex::new(HashMap::new()),
         active_data_count: Mutex::new(0),
         global_live_nodes: Mutex::new(HashMap::new()),
+        all_keys: Mutex::new(Vec::new()),
     });
 
     let iface = interface_name.clone();
@@ -667,6 +704,16 @@ fn main() {
             }
         } else if url.starts_with("/api/kill") {
             request.respond(Response::from_string("{\"status\":\"API Kill Disabled in Multi-Machine Mode\"}")).unwrap();
+        } else if url.starts_with("/api/keys") {
+            let pattern = if let Some((_, query)) = url.split_once('?') {
+                query.split('=').nth(1)
+                    .map(|p| decode(p).unwrap_or_default().to_string())
+                    .unwrap_or_else(|| "*".to_string())
+            } else { "*".to_string() };
+            let keys = shared.all_keys.lock().unwrap();
+            let matching: Vec<&String> = keys.iter().filter(|k| matches_pattern(k, &pattern)).collect();
+            let json = serde_json::json!({"keys": matching, "count": matching.len()});
+            request.respond(Response::from_string(json.to_string())).unwrap();
         } else if url == "/api/stats" {
             let count = *shared.active_data_count.lock().unwrap();
             let map = shared.global_live_nodes.lock().unwrap();
