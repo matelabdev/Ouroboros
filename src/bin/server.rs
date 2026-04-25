@@ -408,9 +408,101 @@ fn main() {
     println!("Starting impactDB L2 Node {} on interface {} (Total Ring Size: {})", node_id, interface_name, total_nodes);
 
     if node_id != 1 {
-        // Run as a pure relay node
-        spawn_node(interface_name, node_id, total_nodes, None, false, use_virtual_mac);
-        return; // Will never reach here
+        // Relay node: gets its own HTTP gateway on port 3000 so CLI can query locally
+        let shared = Arc::new(SharedState {
+            http_responses: Mutex::new(HashMap::new()),
+            active_data_count: Mutex::new(0),
+            global_live_nodes: Mutex::new(HashMap::new()),
+        });
+
+        let iface = interface_name.clone();
+        let s = Arc::clone(&shared);
+        thread::spawn(move || spawn_node(iface, node_id, total_nodes, Some(s), false, use_virtual_mac));
+
+        // Give the ring loop a moment to warm up
+        thread::sleep(Duration::from_millis(1000));
+
+        // Open a second raw TX channel for the HTTP gateway
+        let interfaces = datalink::interfaces();
+        let interface = interfaces.into_iter().find(|i| i.name == interface_name).expect("Interface not found");
+        let mut config2 = datalink::Config::default();
+        config2.read_timeout = Some(Duration::from_millis(10));
+        let mut relay_tx = match datalink::channel(&interface, config2) {
+            Ok(Channel::Ethernet(tx, _)) => tx,
+            _ => panic!("Need Ethernet channel"),
+        };
+        let relay_mac = if use_virtual_mac { get_mac(node_id) } else { interface.mac.expect("No MAC") };
+
+        println!("Starting local HTTP gateway on http://0.0.0.0:3000");
+        let server = Server::http("0.0.0.0:3000").unwrap();
+        for request in server.incoming_requests() {
+            let url = request.url().to_string();
+            if url.starts_with("/api/get") {
+                if let Some((_, query)) = url.split_once('?') {
+                    if let Some(kv) = query.split('=').collect::<Vec<&str>>().get(1) {
+                        let key = decode(kv).unwrap_or_default().to_string();
+                        shared.http_responses.lock().unwrap().remove(&key);
+
+                        let map = shared.global_live_nodes.lock().unwrap();
+                        let query_next_mac = get_next_alive(node_id, total_nodes, &*map, false);
+                        drop(map);
+
+                        let p = Packet::Query { key: key.clone(), origin_mac: node_id as u8, ttl: DEFAULT_TTL };
+                        send_l2_packet(&mut relay_tx, relay_mac, query_next_mac, &p);
+
+                        let start = Instant::now();
+                        let mut assembled_value = None;
+                        while start.elapsed() < Duration::from_secs(2) {
+                            let map = shared.http_responses.lock().unwrap();
+                            if let Some((chunks_map, total_chunks)) = map.get(&key) {
+                                if chunks_map.len() == *total_chunks as usize {
+                                    let mut full_data = Vec::new();
+                                    for i in 0..*total_chunks {
+                                        if let Some(chunk) = chunks_map.get(&i) {
+                                            full_data.extend_from_slice(chunk);
+                                        }
+                                    }
+                                    if let Ok(s) = String::from_utf8(full_data) {
+                                        assembled_value = Some(s);
+                                        break;
+                                    }
+                                }
+                            }
+                            drop(map);
+                            thread::sleep(Duration::from_micros(50));
+                        }
+                        let latency = start.elapsed().as_micros();
+                        if let Some(v) = assembled_value {
+                            let json = serde_json::json!({ "value": v, "latency_us": latency });
+                            request.respond(Response::from_string(json.to_string())).unwrap();
+                        } else {
+                            request.respond(Response::from_string("{\"error\":\"Not Found or Dropped\"}")).unwrap();
+                        }
+                    }
+                }
+            } else if url.starts_with("/api/set") {
+                if let Some((_, query)) = url.split_once('?') {
+                    let parts: Vec<&str> = query.split('&').collect();
+                    let mut k = String::new(); let mut v = String::new();
+                    for part in parts {
+                        if let Some((k_str, v_str)) = part.split_once('=') {
+                            if k_str == "k" { k = decode(v_str).unwrap_or_default().to_string(); }
+                            if k_str == "v" { v = decode(v_str).unwrap_or_default().to_string(); }
+                        }
+                    }
+                    let map = shared.global_live_nodes.lock().unwrap();
+                    let dest = get_next_alive(node_id, total_nodes, &*map, true);
+                    drop(map);
+                    let start = Instant::now();
+                    inject_string_payload(&mut relay_tx, relay_mac, dest, k, v);
+                    let latency = start.elapsed().as_micros();
+                    request.respond(Response::from_string(format!("{{\"status\":\"ok\",\"latency_us\":{}}}", latency))).unwrap();
+                }
+            } else {
+                request.respond(Response::from_string("{\"error\":\"relay node: only /api/get and /api/set are supported\"}")).unwrap();
+            }
+        }
+        return;
     }
 
     // Node 1 is the Gateway/Orchestrator
