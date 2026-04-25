@@ -1,3 +1,5 @@
+<img width="1408" height="768" alt="Firefly_Gemini Flash (1)" src="https://github.com/user-attachments/assets/b2cc6aa6-7ec3-4e10-88c5-c58b247b3105" />
+
 # Ouroboros 🚀
 **The Layer 2 "Data-in-Flight" Storage Engine**
 
