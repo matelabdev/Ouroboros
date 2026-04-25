@@ -53,7 +53,10 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     
     let mut stream = match TcpStream::connect("127.0.0.1:8825") {
-        Ok(s) => s,
+        Ok(s) => {
+            let _ = s.set_nodelay(true);
+            s
+        },
         Err(_) => {
             eprintln!("Could not connect to impactDB on 127.0.0.1:8825.");
             eprintln!("Is the server running?");

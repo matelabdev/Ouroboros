@@ -428,6 +428,7 @@ fn start_tcp_ipc(interface_name: String, node_id: u32, use_virtual_mac: bool, sh
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
+                let _ = stream.set_nodelay(true);
                 let shared = Arc::clone(&shared);
                 let mut tx_box = match datalink::channel(&interface, config) {
                     Ok(Channel::Ethernet(tx, _)) => tx,
