@@ -417,7 +417,7 @@ fn main() {
         std::process::exit(1);
     }
 
-    println!("Starting impactDB L2 Node {} on interface {} (Total Ring Size: {})", node_id, interface_name, total_nodes);
+    println!("Starting impactDB L2 Node {} on interface {} (Peer Autodiscovery Active)", node_id, interface_name);
 
     // In virtual-mac mode, Node 1 owns all relay threads — single command, full cluster
     if use_virtual_mac && node_id == 1 {
@@ -455,8 +455,14 @@ fn main() {
         };
         let relay_mac = if use_virtual_mac { get_mac(node_id) } else { interface.mac.expect("No MAC") };
 
-        println!("Starting local HTTP gateway on http://0.0.0.0:3000");
-        let server = Server::http("0.0.0.0:3000").unwrap();
+        let server = (3000u16..3010)
+            .find_map(|port| {
+                match Server::http(format!("0.0.0.0:{}", port)) {
+                    Ok(s) => { println!("Starting local HTTP gateway on http://0.0.0.0:{}", port); Some(s) }
+                    Err(_) => None,
+                }
+            })
+            .expect("Could not bind to any port in range 3000-3009");
         for request in server.incoming_requests() {
             let url = request.url().to_string();
             if url.starts_with("/api/get") {
@@ -573,9 +579,14 @@ fn main() {
         }
     }
 
-    println!("Starting Web Dashboard on http://0.0.0.0:3000");
-
-    let server = Server::http("0.0.0.0:3000").unwrap();
+    let server = (3000u16..3010)
+        .find_map(|port| {
+            match Server::http(format!("0.0.0.0:{}", port)) {
+                Ok(s) => { println!("Starting Web Dashboard on http://0.0.0.0:{}", port); Some(s) }
+                Err(_) => None,
+            }
+        })
+        .expect("Could not bind to any port in range 3000-3009");
     let html = include_str!("index.html");
 
     for request in server.incoming_requests() {
